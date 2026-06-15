@@ -78,7 +78,7 @@ fileprivate extension HTTPHeaders {
 	}
 }
 
-public final class WebSocketUpgradeHTTPOutput: HTTPOutput {
+public final class WebSocketUpgradeHTTPOutput: HTTPOutput, @unchecked Sendable {
 	private let magicWebSocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	let request: any HTTPRequest
 	let handler: WebSocketHandler
