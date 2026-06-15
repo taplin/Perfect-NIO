@@ -10,7 +10,8 @@ let package = Package(
         .executable(name: "PerfectNIOExe", targets: ["PerfectNIOExe"]),
         .library(name: "PerfectNIO", targets: ["PerfectNIO"]),
         .library(name: "PerfectNIOMustache", targets: ["PerfectNIOMustache"]),
-        .library(name: "PerfectNIOCRUD", targets: ["PerfectNIOCRUD"]),
+        // PerfectNIOCRUD disabled — uses removed .async{} API; restore in Phase 7
+        // .library(name: "PerfectNIOCRUD", targets: ["PerfectNIOCRUD"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
@@ -59,20 +60,34 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
             ]
         ),
-        // Optional: PerfectCRUD database route helpers
-        .target(
-            name: "PerfectNIOCRUD",
-            dependencies: [
-                "PerfectNIO",
-                .product(name: "PerfectCRUD", package: "Perfect-CRUD"),
-                .product(name: "NIO", package: "swift-nio"),
-            ]
-        ),
+        // PerfectNIOCRUD disabled — uses removed .async{} API; restore in Phase 7
+        // .target(
+        //     name: "PerfectNIOCRUD",
+        //     dependencies: [
+        //         "PerfectNIO",
+        //         .product(name: "PerfectCRUD", package: "Perfect-CRUD"),
+        //         .product(name: "NIO", package: "swift-nio"),
+        //     ]
+        // ),
+        // PerfectNIOTests is kept as historical reference but not compiled —
+        // it imports removed packages (PerfectCRUD, PerfectLib, PerfectCURL) and
+        // uses the old EventLoopFuture-based API that Phase 2+3 replaced.
+        // Restore this target in Phase 7 when the test suite is rewritten.
+        // .testTarget(
+        //     name: "PerfectNIOTests",
+        //     dependencies: [
+        //         "PerfectNIO",
+        //         .product(name: "PerfectCURL", package: "Perfect-CURL"),
+        //     ]
+        // ),
+        // New smoke tests — no external deps, uses URLSession for HTTP.
+        // Validates Phase 2+3 async route chain and HTTPOutput.nextChunk() end-to-end.
         .testTarget(
-            name: "PerfectNIOTests",
+            name: "PerfectNIOSmokeTests",
             dependencies: [
                 "PerfectNIO",
-                .product(name: "PerfectCURL", package: "Perfect-CURL"),
+                .product(name: "NIO", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
             ]
         ),
     ]

@@ -31,8 +31,11 @@ public enum RouteError: Error, CustomStringConvertible {
 @resultBuilder
 public struct RouteBuilder<InType, OutType> {
 	public typealias RouteType = Routes<InType, OutType>
+	// buildExpression wraps each route in an array (the component type).
 	public static func buildExpression(_ expression: RouteType) -> [RouteType] { [expression] }
-	public static func buildBlock(_ children: RouteType...) -> [RouteType] { Array(children) }
+	// buildBlock receives [RouteType] components (one per expression) and joins them.
+	public static func buildBlock(_ children: [RouteType]...) -> [RouteType] { Array(children.joined()) }
+	public static func buildBlock() -> [RouteType] { [] }
 }
 
 /// Main routes object. Created by calling `root()` or by chaining a builder method.
