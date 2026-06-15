@@ -103,39 +103,14 @@ public final class WebSocketUpgradeHTTPOutput: HTTPOutput, @unchecked Sendable {
 		extraHeaders.replaceOrAdd(name: "Connection", value: "upgrade")
 		return HTTPHead(status: .switchingProtocols, headers: extraHeaders)
 	}
-	
-	public override func body(promise: EventLoopPromise<IOData?>, allocator: ByteBufferAllocator) {
-		guard !failed, let channel = request.channel, let request = self.request as? NIOHTTPHandler else {
-			return promise.succeed(nil)
-		}
-		request.upgraded = true
-		channel.pipeline.removeHandler(name: "HTTPResponseEncoder")
-		.flatMap {
-			_ in
-			channel.pipeline.removeHandler(name: "HTTPRequestDecoder")
-		}.flatMap {
-			_ in
-			channel.pipeline.removeHandler(name: "HTTPServerPipelineHandler")
-		}.flatMap {
-			_ in
-			channel.pipeline.removeHandler(name: "HTTPServerProtocolErrorHandler")
-		}.flatMap {
-			_ in
-			channel.pipeline.removeHandler(name: "NIOHTTPHandler")
-		}.flatMap {
-			_ in
-			channel.pipeline.addHandlers([	WebSocketFrameEncoder(),
-											ByteToMessageHandler(WebSocketFrameDecoder()),
-											WebSocketProtocolErrorHandler(),
-											NIOWebSocketHandler(channel: channel, socketHandler: self.handler)],
-										 position: .last)
-//		}.then {
-//			channel.setOption(option: ChannelOptions.autoRead, value: false) // !FIX! this made it stop reading altogether. rather have messages be pulled
-		}.whenComplete {
-			_ in
-			promise.succeed(nil)
-		}
-	}
+
+	// Phase 6 work: the legacy upgrade reached into the channel pipeline (removing the
+	// HTTP handlers and adding NIOWebSocketHandler) from inside the response-write step.
+	// That model is incompatible with NIOAsyncChannel, which owns the inbound stream.
+	// Real async WebSocket support will be reimplemented via the NIOTypedHTTPServerUpgrade
+	// configuration in Phase 6. Until then, `webSocket()` routes complete the HTTP handshake
+	// (101 head, written by the serve loop) but do not switch protocols. The NIOWebSocketHandler
+	// implementation below is retained intact for reuse in Phase 6.
 }
 
 public struct WebSocketError: Error, CustomStringConvertible {

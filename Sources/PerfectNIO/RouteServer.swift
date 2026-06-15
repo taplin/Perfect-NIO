@@ -17,15 +17,12 @@
 //
 
 import NIO
+import NIOCore
+import NIOPosix
 import NIOHTTP1
 import NIOSSL
+import NIOConcurrencyHelpers
 import Foundation
-
-nonisolated(unsafe) var sharedNonBlockingFileIO: NonBlockingFileIO = {
-	let threadPool = NIOThreadPool(numberOfThreads: NonBlockingFileIO.defaultThreadPoolSize)
-	threadPool.start()
-	return NonBlockingFileIO(threadPool: threadPool)
-}()
 
 /// Routes which have been bound to a port and have started listening for connections.
 public protocol ListeningRoutes {
@@ -44,119 +41,84 @@ public protocol BoundRoutes {
 	func listen() throws -> ListeningRoutes
 }
 
-class NIOBoundRoutes: BoundRoutes {
-	private let childGroup: EventLoopGroup
-	let acceptGroup: MultiThreadedEventLoopGroup
-	private let channel: Channel
+typealias HTTPConnectionChannel = NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>
+typealias HTTPServerChannel = NIOAsyncChannel<HTTPConnectionChannel, Never>
+
+// Phase 4 keeps the synchronous `bind().listen()` surface (the smoke tests and existing
+// callers depend on it). The NIOAsyncChannel server bootstrap is async-only, so binding is
+// bridged to sync here. Phase 5 replaces this with a natively-async `Server.run(routes:)`.
+final class NIOBoundRoutes: BoundRoutes, @unchecked Sendable {
 	public let address: SocketAddress
+	private let group: MultiThreadedEventLoopGroup
+	private let serverChannel: HTTPServerChannel
+	private let finder: any RouteFinder
+	private let isTLS: Bool
+
 	init(registry: Routes<HTTPRequest, HTTPOutput>,
 		 address: SocketAddress,
-		 threadGroup: EventLoopGroup?,
+		 reusePort: Bool,
 		 tls: TLSConfiguration?) throws {
-		
-		let ag = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-		acceptGroup = ag
-		childGroup = threadGroup ?? ag
 		let finder = try RouteFinderDual(registry)
+		self.finder = finder
 		self.address = address
-		
-		let sslContext: NIOSSLContext?
-		if let tls = tls {
-			sslContext = try NIOSSLContext(configuration: tls)
-		} else {
-			sslContext = nil
-		}
-		var bs = ServerBootstrap(group: acceptGroup, childGroup: childGroup)
-			.serverChannelOption(ChannelOptions.backlog, value: 256)
-			.serverChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
-			.serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
-		if threadGroup == nil {
-			bs = bs.serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEPORT), value: 1)
-		}
-		channel = try bs
-			.childChannelOption(ChannelOptions.socket(IPPROTO_TCP, TCP_NODELAY), value: 1)
-			.childChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
-			.childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
-			.childChannelOption(ChannelOptions.autoRead, value: true)
-			.childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
-			.childChannelOption(ChannelOptions.recvAllocator, value: AdaptiveRecvByteBufferAllocator(minimum: 1024, initial: 4096, maximum: 65536))
-			.childChannelInitializer {
-				channel in
-				NIOBoundRoutes.configureHTTPServerPipeline(pipeline: channel.pipeline, sslContext: sslContext)
-				.flatMap {
-					_ in
-					channel.pipeline.addHandler(NIOHTTPHandler(finder: finder, isTLS: sslContext != nil), name: "NIOHTTPHandler")
+		self.isTLS = tls != nil
+
+		let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+		self.group = group
+
+		let sslContext: NIOSSLContext? = try tls.map { try NIOSSLContext(configuration: $0) }
+
+		// ServerBootstrap is not Sendable, so build and bind it entirely inside the bridged
+		// async closure — only Sendable values (group, address, reusePort, sslContext) cross in.
+		self.serverChannel = try NIOBoundRoutes.runBlocking {
+			var bootstrap = ServerBootstrap(group: group)
+				.serverChannelOption(ChannelOptions.backlog, value: 256)
+				.serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
+			if reusePort {
+				bootstrap = bootstrap.serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEPORT), value: 1)
+			}
+			bootstrap = bootstrap
+				.childChannelOption(ChannelOptions.socket(IPPROTO_TCP, TCP_NODELAY), value: 1)
+				.childChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
+				.childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+			return try await bootstrap.bind(to: address) { childChannel in
+				childChannel.eventLoop.makeCompletedFuture {
+					if let sslContext = sslContext {
+						try childChannel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: sslContext))
+					}
+					try childChannel.pipeline.syncOperations.configureHTTPServerPipeline()
+					return try HTTPConnectionChannel(wrappingChannelSynchronously: childChannel)
 				}
-			}.bind(to: address).wait()
+			}
+		}
 	}
+
 	public func listen() throws -> ListeningRoutes {
-		return NIOListeningRoutes(channel: channel)
+		return NIOListeningRoutes(serverChannel: serverChannel, group: group, finder: finder, isTLS: isTLS)
 	}
-	private static func configureHTTPServerPipeline(pipeline: ChannelPipeline, sslContext: NIOSSLContext?) -> EventLoopFuture<Void> {
-		var handlers: [ChannelHandler] = []
-		if let sslContext = sslContext {
-			let handler = try! NIOSSLServerHandler(context: sslContext)
-			handlers.append(handler)
-			handlers.append(SSLFileRegionHandler())
-		}
-		let responseEncoder = HTTPResponseEncoder()
-		let requestDecoder = HTTPRequestDecoder(leftOverBytesStrategy: .dropBytes)
 
-		return pipeline.addHandlers(handlers)
-			.flatMap { pipeline.addHandler(responseEncoder, name: "HTTPResponseEncoder", position: .last) }
-			.flatMap { pipeline.addHandler(ByteToMessageHandler(requestDecoder), name: "HTTPRequestDecoder", position: .last) }
-			.flatMap { pipeline.addHandler(HTTPServerPipelineHandler(), name: "HTTPServerPipelineHandler", position: .last) }
-			.flatMap { pipeline.addHandler(HTTPServerProtocolErrorHandler(), name: "HTTPServerProtocolErrorHandler", position: .last) }
+	/// Runs an async operation to completion from a synchronous context.
+	/// Safe here because the caller is an application/test thread, not a cooperative-pool
+	/// thread, so blocking it does not starve the async runtime.
+	static func runBlocking<T: Sendable>(_ body: @escaping @Sendable () async throws -> T) throws -> T {
+		let resultBox = NIOLockedValueBox<Result<T, Error>?>(nil)
+		let semaphore = DispatchSemaphore(value: 0)
+		Task {
+			let r: Result<T, Error>
+			do { r = .success(try await body()) }
+			catch { r = .failure(error) }
+			resultBox.withLockedValue { $0 = r }
+			semaphore.signal()
+		}
+		semaphore.wait()
+		return try resultBox.withLockedValue { $0! }.get()
 	}
 }
 
-private final class SSLFileRegionHandler: ChannelOutboundHandler {
-	typealias OutboundIn = IOData
-	typealias OutboundOut = IOData
-	
-	private static let fileIO = sharedNonBlockingFileIO
-	private typealias BufferedWrite = (data: IOData, promise: EventLoopPromise<Void>?)
-	private var buffer = MarkedCircularBuffer<BufferedWrite>(initialCapacity: 96)
-	
-	func write(context: ChannelHandlerContext,
-			   data: NIOAny,
-			   promise: EventLoopPromise<Void>?) {
-		buffer.append((data: unwrapOutboundIn(data), promise: promise))
-	}
-	func flush(context: ChannelHandlerContext) {
-		buffer.mark()
-		flushBuffer(context: context)
-	}
-	func flushBuffer(context: ChannelHandlerContext) {
-		guard buffer.hasMark else {
-			return context.flush()
-		}
-		guard let item = buffer.popFirst() else {
-			return
-		}
-		let unwrapped = item.data
-		let promise = item.promise
-		
-		switch unwrapped {
-		case .fileRegion(let region):
-			SSLFileRegionHandler.fileIO.readChunked(fileRegion: region,
-													allocator: ByteBufferAllocator(),
-													eventLoop: context.eventLoop) {
-														context.writeAndFlush(self.wrapOutboundOut(.byteBuffer($0)))
-			}.always {
-				_ in
-				self.flushBuffer(context: context)
-			}.cascade(to: promise)
-		case .byteBuffer(_):
-			context.write(wrapOutboundOut(unwrapped), promise: promise)
-			flushBuffer(context: context)
-		}
-	}
-}
-
-class NIOListeningRoutes: ListeningRoutes {
-	private let channel: Channel
-	private let f: EventLoopFuture<Void>
+final class NIOListeningRoutes: ListeningRoutes, @unchecked Sendable {
+	private let underlyingChannel: Channel
+	private let group: MultiThreadedEventLoopGroup
+	private let task: Task<Void, Never>
 	private nonisolated(unsafe) static var globalInitialized: Bool = {
 		var sa = sigaction()
 		// !FIX! re-evaluate which of these are required
@@ -179,18 +141,40 @@ class NIOListeningRoutes: ListeningRoutes {
 	#endif
 		return true
 	}()
-	init(channel: Channel) {
+
+	init(serverChannel: HTTPServerChannel,
+		 group: MultiThreadedEventLoopGroup,
+		 finder: any RouteFinder,
+		 isTLS: Bool) {
 		_ = NIOListeningRoutes.globalInitialized
-		self.channel = channel
-		f = channel.closeFuture
+		self.underlyingChannel = serverChannel.channel
+		self.group = group
+		// One task per server channel runs the accept loop; each accepted connection
+		// is handled in its own child task so slow clients never block the accept loop.
+		self.task = Task {
+			do {
+				try await withThrowingDiscardingTaskGroup { taskGroup in
+					try await serverChannel.executeThenClose { inbound in
+						for try await connectionChannel in inbound {
+							taskGroup.addTask {
+								await NIOAsyncHTTPServer.handleConnection(connectionChannel, finder: finder, isTLS: isTLS)
+							}
+						}
+					}
+				}
+			} catch {
+				// Server channel closed (via stop()) or the accept loop failed.
+			}
+		}
 	}
+
 	@discardableResult
 	public func stop() -> ListeningRoutes {
-		channel.close(promise: nil)
+		underlyingChannel.close(promise: nil)
 		return self
 	}
 	public func wait() throws {
-		try f.wait()
+		try underlyingChannel.closeFuture.wait()
 	}
 }
 
@@ -200,20 +184,14 @@ public extension Routes where InType == HTTPRequest, OutType == HTTPOutput {
 		return try bind(address: address, tls: tls)
 	}
 	func bind(address: SocketAddress, tls: TLSConfiguration? = nil) throws -> BoundRoutes {
-		return try NIOBoundRoutes(registry: self,
-								  address: address,
-								  threadGroup: MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount),
-								  tls: tls)
+		return try NIOBoundRoutes(registry: self, address: address, reusePort: false, tls: tls)
 	}
 	func bind(count: Int, address: SocketAddress, tls: TLSConfiguration? = nil) throws -> [BoundRoutes] {
 		if count == 1 {
-			return [try bind(address: address)]
+			return [try bind(address: address, tls: tls)]
 		}
 		return try (0..<count).map { _ in
-			return try NIOBoundRoutes(registry: self,
-									  address: address,
-									  threadGroup: nil,
-									  tls: tls)
+			try NIOBoundRoutes(registry: self, address: address, reusePort: true, tls: tls)
 		}
 	}
 }

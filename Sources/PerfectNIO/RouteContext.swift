@@ -20,8 +20,9 @@ import NIOHTTP1
 /// Per-request state carried through the async route pipeline.
 /// Replaces the legacy HandlerState + RouteValueBox pair.
 public struct RouteContext: @unchecked Sendable {
-    // The underlying HTTP request — reference type, event-loop bound.
-    // @unchecked Sendable because NIOHTTPHandler is not truly Sendable until Phase 4.
+    // The underlying HTTP request — a reference type owned by a single connection task.
+    // @unchecked Sendable: the request (NIOAsyncHTTPRequest) buffers its body up front and
+    // is not shared across connection tasks.
     let request: any HTTPRequest
     public var responseStatus: HTTPResponseStatus = .ok
     public var responseHeaders: HTTPHeaders = .init()

@@ -11,7 +11,7 @@ import NIOHTTP1
 import NIO
 import PerfectNIO
 
-public class MustacheOutput: HTTPOutput {
+public class MustacheOutput: HTTPOutput, @unchecked Sendable {
 	private let responseHead: HTTPHead?
 	private var bodyBytes: [UInt8]?
 	public init(templatePath: String,
@@ -30,14 +30,11 @@ public class MustacheOutput: HTTPOutput {
 	public override func head(request: HTTPRequestInfo) -> HTTPHead? {
 		return responseHead
 	}
-	public override func body(promise: EventLoopPromise<IOData?>, allocator: ByteBufferAllocator) {
-		if let b = bodyBytes {
-			bodyBytes = nil
-			var buf = allocator.buffer(capacity: b.count)
-			buf.writeBytes(b)
-			promise.succeed(IOData.byteBuffer(buf))
-		} else {
-			promise.succeed(nil)
-		}
+	public override func nextChunk(allocator: ByteBufferAllocator) async throws -> ByteBuffer? {
+		guard let b = bodyBytes else { return nil }
+		bodyBytes = nil
+		var buf = allocator.buffer(capacity: b.count)
+		buf.writeBytes(b)
+		return buf
 	}
 }

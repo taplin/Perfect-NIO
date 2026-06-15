@@ -26,28 +26,10 @@ open class HTTPOutput: @unchecked Sendable {
 	open func head(request: HTTPRequestInfo) -> HTTPHead? { nil }
 
 	/// Produce the next chunk of body data. Return nil when the body is complete.
-	/// Subclasses override this. The base-class bridge forwards calls to body(promise:allocator:)
-	/// for backward compatibility during the Phase 3 → Phase 4 transition.
+	/// The connection serve loop pulls the body by calling this repeatedly until it returns nil.
 	open func nextChunk(allocator: ByteBufferAllocator) async throws -> ByteBuffer? { nil }
 
 	/// Called when the response has been fully written or on error.
 	/// Override to perform cleanup (e.g. closing file handles).
 	open func closed() {}
-
-	// Bridge: forwards NIOHTTPHandler's promise-pull into nextChunk().
-	// Kept open so WebSocketUpgradeHTTPOutput can still override it (Phase 6 will remove the need).
-	// Subclasses should override nextChunk() instead.
-	open func body(promise: EventLoopPromise<IOData?>, allocator: ByteBufferAllocator) {
-		Task {
-			do {
-				if let buf = try await self.nextChunk(allocator: allocator) {
-					promise.succeed(.byteBuffer(buf))
-				} else {
-					promise.succeed(nil)
-				}
-			} catch {
-				promise.fail(error)
-			}
-		}
-	}
 }
