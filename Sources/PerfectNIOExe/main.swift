@@ -52,6 +52,5 @@ let socket = root().echo.webSocket(protocol: "echo") {
 	}
 }
 
-let address = try SocketAddress(ipAddress: "0.0.0.0", port: 42000)
-let server = try root().dir(index, socket).bind(address: address).listen()
-try server.wait()
+let routes = try root().dir(index, socket)
+try await Server(routes: routes, port: 42000).run()

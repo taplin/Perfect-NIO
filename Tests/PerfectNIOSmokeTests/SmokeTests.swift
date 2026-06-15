@@ -2,11 +2,13 @@
 //  SmokeTests.swift
 //  PerfectNIOSmokeTests
 //
-//  Validates Phase 2 (async route chain) and Phase 3 (HTTPOutput.nextChunk) end-to-end.
+//  Validates Phase 2 (async route chain), Phase 3 (HTTPOutput.nextChunk), Phase 4
+//  (NIOAsyncChannel serve loop) and Phase 5 (async Server API) end-to-end.
 //  Uses URLSession — no external dependencies beyond Foundation.
 //
-//  Port 42100 (old tests use 42000). Tests in a single XCTestCase class run serially,
-//  so port reuse between tests is safe as long as each test defers server.stop().
+//  Each server test runs inside Server.withServer { }, which binds, runs the body, then
+//  shuts the server down (channels + EventLoopGroup) before returning. Tests in a single
+//  XCTestCase run serially, so reusing the fixed port across tests is safe.
 //
 
 import XCTest
@@ -35,6 +37,13 @@ final class PerfectNIOSmokeTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// Binds `routes` on the test port, runs `body` against the live server, then shuts down.
+    @discardableResult
+    private func withServer<R>(_ routes: Routes<HTTPRequest, HTTPOutput>,
+                              _ body: () async throws -> R) async throws -> R {
+        try await Server(routes: routes, port: port).withServer { _ in try await body() }
+    }
 
     private func url(_ path: String) -> URL {
         URL(string: "http://localhost:\(port)\(path)")!
@@ -77,37 +86,35 @@ final class PerfectNIOSmokeTests: XCTestCase {
     // MARK: - Basic routing
 
     func testBasicText() async throws {
-        let server = try root { "OK" }.text().bind(port: port).listen()
-        defer { try? server.stop().wait() }
-
-        let (data, response) = try await get("/")
-        XCTAssertEqual(response.statusCode, 200)
-        XCTAssertEqual(String(data: data, encoding: .utf8), "OK")
+        try await withServer(root { "OK" }.text()) {
+            let (data, response) = try await get("/")
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), "OK")
+        }
     }
 
     func testMultiplePaths() async throws {
         let p = root(path: "/", HTTPRequest.self)
-        let server = try root().dir(
+        let routes = try root().dir(
             p.alpha { "alpha" },
             p.beta  { "beta"  }
-        ).text().bind(port: port).listen()
-        defer { try? server.stop().wait() }
+        ).text()
+        try await withServer(routes) {
+            let (d1, r1) = try await get("/alpha")
+            XCTAssertEqual(r1.statusCode, 200)
+            XCTAssertEqual(String(data: d1, encoding: .utf8), "alpha")
 
-        let (d1, r1) = try await get("/alpha")
-        XCTAssertEqual(r1.statusCode, 200)
-        XCTAssertEqual(String(data: d1, encoding: .utf8), "alpha")
-
-        let (d2, r2) = try await get("/beta")
-        XCTAssertEqual(r2.statusCode, 200)
-        XCTAssertEqual(String(data: d2, encoding: .utf8), "beta")
+            let (d2, r2) = try await get("/beta")
+            XCTAssertEqual(r2.statusCode, 200)
+            XCTAssertEqual(String(data: d2, encoding: .utf8), "beta")
+        }
     }
 
     func testNotFound() async throws {
-        let server = try root { "OK" }.text().bind(port: port).listen()
-        defer { try? server.stop().wait() }
-
-        let (_, response) = try await get("/does-not-exist")
-        XCTAssertEqual(response.statusCode, 404)
+        try await withServer(root { "OK" }.text()) {
+            let (_, response) = try await get("/does-not-exist")
+            XCTAssertEqual(response.statusCode, 404)
+        }
     }
 
     func testDuplicateRouteThrows() {
@@ -125,86 +132,82 @@ final class PerfectNIOSmokeTests: XCTestCase {
 
     func testWildcard() async throws {
         // /captured/suffix — wild captures the first segment, "suffix" is a literal path step
-        let server = try root().wild { $1 }.suffix.text().bind(port: port).listen()
-        defer { try? server.stop().wait() }
-
-        let (data, response) = try await get("/hello/suffix")
-        XCTAssertEqual(response.statusCode, 200)
-        XCTAssertEqual(String(data: data, encoding: .utf8), "hello")
+        try await withServer(root().wild { $1 }.suffix.text()) {
+            let (data, response) = try await get("/hello/suffix")
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), "hello")
+        }
     }
 
     func testNamedWildcard() async throws {
-        let server = try root()
+        let routes = root()
             .wild(name: "id")
             .info
             .request { (_, req) in req.uriVariables["id"] ?? "missing" }
             .text()
-            .bind(port: port).listen()
-        defer { try? server.stop().wait() }
-
-        let (data, response) = try await get("/abc123/info")
-        XCTAssertEqual(response.statusCode, 200)
-        XCTAssertEqual(String(data: data, encoding: .utf8), "abc123")
+        try await withServer(routes) {
+            let (data, response) = try await get("/abc123/info")
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), "abc123")
+        }
     }
 
     func testTrailingWildcard() async throws {
-        let server = try root().base.trailing { $1 }.text().bind(port: port).listen()
-        defer { try? server.stop().wait() }
-
-        let (data, _) = try await get("/base/a/b/c")
-        XCTAssertEqual(String(data: data, encoding: .utf8), "a/b/c")
+        try await withServer(root().base.trailing { $1 }.text()) {
+            let (data, _) = try await get("/base/a/b/c")
+            XCTAssertEqual(String(data: data, encoding: .utf8), "a/b/c")
+        }
     }
 
     // MARK: - HTTP method routing
 
     func testMethodRouting() async throws {
         let p = root(path: "/", HTTPRequest.self)
-        let server = try root().dir(
+        let routes = try root().dir(
             p.GET.getonly  { "GET response"  },
             p.POST.postonly { "POST response" }
-        ).text().bind(port: port).listen()
-        defer { try? server.stop().wait() }
+        ).text()
+        try await withServer(routes) {
+            let (d1, r1) = try await get("/getonly")
+            XCTAssertEqual(r1.statusCode, 200)
+            XCTAssertEqual(String(data: d1, encoding: .utf8), "GET response")
 
-        let (d1, r1) = try await get("/getonly")
-        XCTAssertEqual(r1.statusCode, 200)
-        XCTAssertEqual(String(data: d1, encoding: .utf8), "GET response")
+            let (d2, r2) = try await post("/postonly", body: Data())
+            XCTAssertEqual(r2.statusCode, 200)
+            XCTAssertEqual(String(data: d2, encoding: .utf8), "POST response")
 
-        let (d2, r2) = try await post("/postonly", body: Data())
-        XCTAssertEqual(r2.statusCode, 200)
-        XCTAssertEqual(String(data: d2, encoding: .utf8), "POST response")
-
-        // Wrong method → 404
-        let (_, r3) = try await post("/getonly", body: Data())
-        XCTAssertEqual(r3.statusCode, 404)
+            // Wrong method → 404
+            let (_, r3) = try await post("/getonly", body: Data())
+            XCTAssertEqual(r3.statusCode, 404)
+        }
     }
 
     // MARK: - Response types
 
     func testJSONOutput() async throws {
         struct Greeting: Codable { let message: String }
-        let server = try root { Greeting(message: "hello") }.json().bind(port: port).listen()
-        defer { try? server.stop().wait() }
-
-        let (data, response) = try await get("/")
-        XCTAssertEqual(response.statusCode, 200)
-        let decoded = try JSONDecoder().decode(Greeting.self, from: data)
-        XCTAssertEqual(decoded.message, "hello")
+        try await withServer(root { Greeting(message: "hello") }.json()) {
+            let (data, response) = try await get("/")
+            XCTAssertEqual(response.statusCode, 200)
+            let decoded = try JSONDecoder().decode(Greeting.self, from: data)
+            XCTAssertEqual(decoded.message, "hello")
+        }
     }
 
     func testStatusCheck() async throws {
         let p = root(path: "/", HTTPRequest.self)
-        let server = try root().dir(
+        let routes = try root().dir(
             p.ok.statusCheck { .ok }.map { "OK" },
             p.forbidden.statusCheck { HTTPResponseStatus.forbidden }.map { "NEVER" }
-        ).text().bind(port: port).listen()
-        defer { try? server.stop().wait() }
+        ).text()
+        try await withServer(routes) {
+            let (data, r1) = try await get("/ok")
+            XCTAssertEqual(r1.statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), "OK")
 
-        let (data, r1) = try await get("/ok")
-        XCTAssertEqual(r1.statusCode, 200)
-        XCTAssertEqual(String(data: data, encoding: .utf8), "OK")
-
-        let (_, r2) = try await get("/forbidden")
-        XCTAssertEqual(r2.statusCode, 403)
+            let (_, r2) = try await get("/forbidden")
+            XCTAssertEqual(r2.statusCode, 403)
+        }
     }
 
     func testUnwrap() async throws {
@@ -213,53 +216,51 @@ final class PerfectNIOSmokeTests: XCTestCase {
             p.present { Optional("found") },
             p.absent  { Optional<String>.none }
         )
-        let server = try routes.unwrap { $0 }.text().bind(port: port).listen()
-        defer { try? server.stop().wait() }
+        try await withServer(routes.unwrap { $0 }.text()) {
+            let (data, r1) = try await get("/present")
+            XCTAssertEqual(r1.statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), "found")
 
-        let (data, r1) = try await get("/present")
-        XCTAssertEqual(r1.statusCode, 200)
-        XCTAssertEqual(String(data: data, encoding: .utf8), "found")
-
-        let (_, r2) = try await get("/absent")
-        XCTAssertEqual(r2.statusCode, 500)
+            let (_, r2) = try await get("/absent")
+            XCTAssertEqual(r2.statusCode, 500)
+        }
     }
 
     // MARK: - Request body handling
 
     func testPOSTBodyReading() async throws {
-        let server = try root().POST.readBody { (_, body) -> String in
+        let routes = root().POST.readBody { (_, body) -> String in
             switch body {
             case .other(let bytes): return String(bytes: bytes, encoding: .utf8) ?? "?"
             default: return "unexpected content type"
             }
-        }.text().bind(port: port).listen()
-        defer { try? server.stop().wait() }
-
-        let payload = "hello from the test"
-        let (data, response) = try await post("/", body: Data(payload.utf8))
-        XCTAssertEqual(response.statusCode, 200)
-        XCTAssertEqual(String(data: data, encoding: .utf8), payload)
+        }.text()
+        try await withServer(routes) {
+            let payload = "hello from the test"
+            let (data, response) = try await post("/", body: Data(payload.utf8))
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), payload)
+        }
     }
 
     func testJSONDecode() async throws {
         struct Payload: Codable { let x: Int }
-        let server = try root().POST
+        let routes = root().POST
             .decode(Payload.self) { payload in payload.x * 2 }
             .json()
-            .bind(port: port).listen()
-        defer { try? server.stop().wait() }
-
-        let body = try JSONEncoder().encode(Payload(x: 21))
-        let (data, response) = try await post("/", body: body, contentType: "application/json")
-        XCTAssertEqual(response.statusCode, 200)
-        let result = try JSONDecoder().decode(Int.self, from: data)
-        XCTAssertEqual(result, 42)
+        try await withServer(routes) {
+            let body = try JSONEncoder().encode(Payload(x: 21))
+            let (data, response) = try await post("/", body: body, contentType: "application/json")
+            XCTAssertEqual(response.statusCode, 200)
+            let result = try JSONDecoder().decode(Int.self, from: data)
+            XCTAssertEqual(result, 42)
+        }
     }
 
     // MARK: - Phase 3: custom HTTPOutput.nextChunk()
 
     func testCustomNextChunkOutput() async throws {
-        // Verifies that the async nextChunk() pull loop in NIOHTTPHandler works end-to-end.
+        // Verifies that the async nextChunk() pull loop in the serve loop works end-to-end.
         class ChunkedOutput: HTTPOutput, @unchecked Sendable {
             var count = 0
             override func head(request: HTTPRequestInfo) -> HTTPHead? {
@@ -275,17 +276,16 @@ final class PerfectNIOSmokeTests: XCTestCase {
             }
         }
 
-        let server = try root { ChunkedOutput() as HTTPOutput }.bind(port: port).listen()
-        defer { try? server.stop().wait() }
-
-        let (data, response) = try await get("/")
-        XCTAssertEqual(response.statusCode, 200)
-        XCTAssertEqual(data.count, 4096)
-        XCTAssertEqual(data[0],    UInt8(ascii: "0"))
-        XCTAssertEqual(data[1023], UInt8(ascii: "0"))
-        XCTAssertEqual(data[1024], UInt8(ascii: "1"))
-        XCTAssertEqual(data[2048], UInt8(ascii: "2"))
-        XCTAssertEqual(data[3072], UInt8(ascii: "3"))
+        try await withServer(root { ChunkedOutput() as HTTPOutput }) {
+            let (data, response) = try await get("/")
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(data.count, 4096)
+            XCTAssertEqual(data[0],    UInt8(ascii: "0"))
+            XCTAssertEqual(data[1023], UInt8(ascii: "0"))
+            XCTAssertEqual(data[1024], UInt8(ascii: "1"))
+            XCTAssertEqual(data[2048], UInt8(ascii: "2"))
+            XCTAssertEqual(data[3072], UInt8(ascii: "3"))
+        }
     }
 
     // MARK: - Built-in output types
@@ -296,13 +296,12 @@ final class PerfectNIOSmokeTests: XCTestCase {
         try Data(content.utf8).write(to: URL(fileURLWithPath: tmpPath))
         defer { try? FileManager.default.removeItem(atPath: tmpPath) }
 
-        let server = try root().f { try FileOutput(localPath: tmpPath) as HTTPOutput }
-            .bind(port: port).listen()
-        defer { try? server.stop().wait() }
-
-        let (data, response) = try await get("/f")
-        XCTAssertEqual(response.statusCode, 200)
-        XCTAssertEqual(String(data: data, encoding: .utf8), content)
+        let routes = root().f { try FileOutput(localPath: tmpPath) as HTTPOutput }
+        try await withServer(routes) {
+            let (data, response) = try await get("/f")
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), content)
+        }
     }
 
     func testCompression() async throws {
@@ -314,13 +313,30 @@ final class PerfectNIOSmokeTests: XCTestCase {
         }
         let expected = String(bytes: bytes, encoding: .utf8)!
 
-        let server = try root { BytesOutput(body: bytes) as HTTPOutput }
-            .compressed()
-            .bind(port: port).listen()
-        defer { try? server.stop().wait() }
+        let routes = root { BytesOutput(body: bytes) as HTTPOutput }.compressed()
+        try await withServer(routes) {
+            let (data, response) = try await get("/")
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), expected)
+        }
+    }
 
-        let (data, response) = try await get("/")
-        XCTAssertEqual(response.statusCode, 200)
-        XCTAssertEqual(String(data: data, encoding: .utf8), expected)
+    // MARK: - Phase 5: idle timeout
+
+    func testIdleTimeoutClosesConnection() async throws {
+        // A short read-idle timeout must close an otherwise-idle keep-alive connection.
+        // We make one request (succeeds), then confirm the server is still serving new
+        // connections after the idle one would have been dropped.
+        let server = Server(routes: root { "OK" }.text(), port: port, idleTimeout: .milliseconds(200))
+        try await server.withServer { _ in
+            let (data, r1) = try await get("/")
+            XCTAssertEqual(r1.statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), "OK")
+
+            // Wait past the idle timeout; the server must still accept a fresh request.
+            try await Task.sleep(for: .milliseconds(400))
+            let (_, r2) = try await get("/")
+            XCTAssertEqual(r2.statusCode, 200)
+        }
     }
 }

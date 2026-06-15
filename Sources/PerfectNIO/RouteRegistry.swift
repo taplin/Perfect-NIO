@@ -78,6 +78,11 @@ public struct Routes<InType, OutType> {
 	}
 }
 
+// Safe: the only stored property is `routes: [String: Handler]`, and `Handler` is a
+// `@Sendable` function type — so a `Routes` value is just Sendable closures + String keys,
+// regardless of `InType`/`OutType` (which appear only in the closure signatures).
+extension Routes: @unchecked Sendable {}
+
 // MARK: - Root constructors
 
 /// Create a root route that passes the HTTPRequest through unchanged.
