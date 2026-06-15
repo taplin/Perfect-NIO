@@ -20,10 +20,9 @@ import Foundation
 import PerfectCRUD
 import Dispatch
 import NIO
+import PerfectNIO
 
 public typealias DCP = DatabaseConfigurationProtocol
-
-let foreignEventsQueue = DispatchQueue(label: "foreignEventsQueue", attributes: .concurrent)
 
 public extension Routes {
 	func db<C: DCP, NewOut>(_ provide: @autoclosure @escaping () throws -> Database<C>,

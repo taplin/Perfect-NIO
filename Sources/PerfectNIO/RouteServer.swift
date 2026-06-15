@@ -21,7 +21,7 @@ import NIOHTTP1
 import NIOSSL
 import Foundation
 
-var sharedNonBlockingFileIO: NonBlockingFileIO = {
+nonisolated(unsafe) var sharedNonBlockingFileIO: NonBlockingFileIO = {
 	let threadPool = NIOThreadPool(numberOfThreads: NonBlockingFileIO.defaultThreadPoolSize)
 	threadPool.start()
 	return NonBlockingFileIO(threadPool: threadPool)
@@ -157,7 +157,7 @@ private final class SSLFileRegionHandler: ChannelOutboundHandler {
 class NIOListeningRoutes: ListeningRoutes {
 	private let channel: Channel
 	private let f: EventLoopFuture<Void>
-	private static var globalInitialized: Bool = {
+	private nonisolated(unsafe) static var globalInitialized: Bool = {
 		var sa = sigaction()
 		// !FIX! re-evaluate which of these are required
 	#if os(Linux)
@@ -391,20 +391,15 @@ extension String {
 }
 
 public extension Routes {
-	var GET: Routes<InType, OutType> { return method(.GET) }
-	var POST: Routes { return method(.POST) }
-	var PUT: Routes { return method(.PUT) }
-	var DELETE: Routes { return method(.DELETE) }
-	var OPTIONS: Routes { return method(.OPTIONS) }
+	var GET: Routes<InType, OutType> { method(.GET) }
+	var POST: Routes { method(.POST) }
+	var PUT: Routes { method(.PUT) }
+	var DELETE: Routes { method(.DELETE) }
+	var OPTIONS: Routes { method(.OPTIONS) }
 	func method(_ method: HTTPMethod, _ methods: HTTPMethod...) -> Routes {
-		let methods = [method] + methods
-		return .init(.init(routes:
-			registry.routes.flatMap {
-				route in
-				return methods.map {
-					($0.name + "://" + route.0.splitMethod.1, route.1)
-				}
-			}
-		))
+		let allMethods = [method] + methods
+		return .init(Dictionary(routes.flatMap { key, handler in
+			allMethods.map { m in (m.name + "://" + key.splitMethod.1, handler) }
+		}, uniquingKeysWith: { $1 }))
 	}
 }

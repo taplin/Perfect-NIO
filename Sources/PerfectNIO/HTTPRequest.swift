@@ -21,12 +21,12 @@ public enum HTTPRequestContentType {
 	case other([UInt8])
 }
 
-public protocol HTTPRequest {
+public protocol HTTPRequest: AnyObject {
 	var channel: Channel? { get }
 	var method: HTTPMethod { get }
 	var uri: String { get }
 	var headers: HTTPHeaders { get }
-	var uriVariables: [String:String] { get set }
+	var uriVariables: [String: String] { get set }
 	var path: String { get }
 	var searchArgs: QueryDecoder? { get }
 	var contentType: String? { get }
@@ -35,13 +35,13 @@ public protocol HTTPRequest {
 	var contentConsumed: Int { get }
 	var localAddress: SocketAddress? { get }
 	var remoteAddress: SocketAddress? { get }
-	func readSomeContent() -> EventLoopFuture<[ByteBuffer]>
-	func readContent() -> EventLoopFuture<HTTPRequestContentType>
+	func readSomeContent() async throws -> [ByteBuffer]
+	func readContent() async throws -> HTTPRequestContentType
 }
 
 public extension HTTPRequest {
-	/// Returns all the cookie name/value pairs parsed from the request.
-	var cookies: [String:String] {
+	/// Returns all cookie name/value pairs parsed from the request.
+	var cookies: [String: String] {
 		guard let cookie = self.headers["cookie"].first else {
 			return [:]
 		}
@@ -50,6 +50,6 @@ public extension HTTPRequest {
 			guard d.count == 2 else { return nil }
 			let d2 = d.map { String($0.filter { $0 != Character(" ") }).stringByDecodingURL ?? "" }
 			return (d2[0], d2[1])
-			}, uniquingKeysWith: {$1})
+		}, uniquingKeysWith: { $1 })
 	}
 }

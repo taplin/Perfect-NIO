@@ -23,7 +23,7 @@
 
 import Foundation
 import NIOHTTP1
-import PerfectCZlib
+import CZlib
 import NIO
 
 internal extension String {

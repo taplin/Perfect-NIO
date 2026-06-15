@@ -37,7 +37,7 @@ public enum HTTPOutputResponseHint {
 }
 
 /// The response output for the client
-open class HTTPOutput {
+open class HTTPOutput: @unchecked Sendable {
 	/// Indicates how the `body` func data, and possibly content-length, should be handled
 	var kind: HTTPOutputResponseHint = .fixed // !FIX! is this utilized?
 	public init() {}

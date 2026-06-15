@@ -17,7 +17,8 @@
 //===----------------------------------------------------------------------===//
 //
 
-import CNIOSHA1
+import CryptoKit
+import Foundation
 import NIO
 import NIOHTTP1
 import NIOWebSocket
@@ -59,11 +60,10 @@ public protocol WebSocket {
 public typealias WebSocketHandler = (WebSocket) -> ()
 
 public extension Routes {
-	func webSocket(protocol: String, _ callback: @escaping (OutType) throws -> WebSocketHandler) -> Routes<InType, HTTPOutput> {
-		return applyFuncs {
-			return $0.flatMapThrowing {
-				RouteValueBox($0.state, WebSocketUpgradeHTTPOutput(request: $0.state.request, handler: try callback($0.value)))
-			}
+	func webSocket(protocol: String, _ callback: @Sendable @escaping (OutType) async throws -> WebSocketHandler) -> Routes<InType, HTTPOutput> {
+		applyFuncs { ctx, output in
+			let handler = try await callback(output)
+			return (ctx, WebSocketUpgradeHTTPOutput(request: ctx.request, handler: handler))
 		}
 	}
 }
@@ -80,29 +80,24 @@ fileprivate extension HTTPHeaders {
 
 public final class WebSocketUpgradeHTTPOutput: HTTPOutput {
 	private let magicWebSocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	let request: HTTPRequest
+	let request: any HTTPRequest
 	let handler: WebSocketHandler
 	var failed = false
-	public init(request: HTTPRequest, handler: @escaping WebSocketHandler) {
+	public init(request: any HTTPRequest, handler: @escaping WebSocketHandler) {
 		self.request = request
 		self.handler = handler
 	}
 	public override func head(request: HTTPRequestInfo) -> HTTPHead? {
 		var extraHeaders = HTTPHeaders()
-		// The version must be 13.
 		guard let key = request.head.headers.nonListHeader("Sec-WebSocket-Key"),
-			let version = request.head.headers.nonListHeader("Sec-WebSocket-Version"),
-			version == "13" else {
-				failed = true
-				return HTTPHead(status: .badRequest, headers: extraHeaders)
+		      let version = request.head.headers.nonListHeader("Sec-WebSocket-Version"),
+		      version == "13" else {
+			failed = true
+			return HTTPHead(status: .badRequest, headers: extraHeaders)
 		}
-		let acceptValue: String
-		do {
-			var hasher = SHA1()
-			hasher.update(string: key)
-			hasher.update(string: magicWebSocketGUID)
-			acceptValue = String(base64Encoding: hasher.finish())
-		}
+		let hashInput = Data((key + magicWebSocketGUID).utf8)
+		let hashBytes = Array(Insecure.SHA1.hash(data: hashInput))
+		let acceptValue = String(base64Encoding: hashBytes)
 		extraHeaders.replaceOrAdd(name: "Upgrade", value: "websocket")
 		extraHeaders.add(name: "Sec-WebSocket-Accept", value: acceptValue)
 		extraHeaders.replaceOrAdd(name: "Connection", value: "upgrade")
@@ -447,45 +442,3 @@ private extension String {
 }
 
 
-private struct SHA1 {
-	private var sha1Ctx: SHA1_CTX
-	
-	/// Create a brand-new hash context.
-	init() {
-		self.sha1Ctx = SHA1_CTX()
-		c_nio_sha1_init(&self.sha1Ctx)
-	}
-	
-	/// Feed the given string into the hash context as a sequence of UTF-8 bytes.
-	///
-	/// - parameters:
-	///     - string: The string that will be UTF-8 encoded and fed into the
-	///         hash context.
-	mutating func update(string: String) {
-		let buffer = Array(string.utf8)
-		buffer.withUnsafeBufferPointer {
-			self.update($0)
-		}
-	}
-	
-	/// Feed the bytes into the hash context.
-	///
-	/// - parameters:
-	///     - bytes: The bytes to feed into the hash context.
-	mutating func update(_ bytes: UnsafeBufferPointer<UInt8>) {
-		c_nio_sha1_loop(&self.sha1Ctx, bytes.baseAddress!, bytes.count)
-	}
-	
-	/// Complete the hashing.
-	///
-	/// - returns: A 20-byte array of bytes.
-	mutating func finish() -> [UInt8] {
-		var hashResult: [UInt8] = Array(repeating: 0, count: 20)
-		hashResult.withUnsafeMutableBufferPointer {
-			$0.baseAddress!.withMemoryRebound(to: Int8.self, capacity: 20) {
-				c_nio_sha1_result(&self.sha1Ctx, $0)
-			}
-		}
-		return hashResult
-	}
-}

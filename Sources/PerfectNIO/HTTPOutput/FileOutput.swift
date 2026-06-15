@@ -17,26 +17,13 @@
 //
 
 import Foundation
+import CryptoKit
 import NIO
 import NIOHTTP1
-import PerfectLib
-import PerfectMIME
-import CNIOSHA1
 
 extension String.UTF8View {
 	var sha1: [UInt8] {
-		let bytes = UnsafeMutablePointer<Int8>.allocate(capacity:  Int(SHA1_RESULTLEN))
-		defer { bytes.deallocate() }
-		let src = Array<UInt8>(self)
-		var ctx = SHA1_CTX()
-		c_nio_sha1_init(&ctx)
-		c_nio_sha1_loop(&ctx, src, src.count)
-		c_nio_sha1_result(&ctx, bytes)
-		var r = [UInt8]()
-		for idx in 0..<Int(SHA1_RESULTLEN) {
-			r.append(UInt8(bitPattern: bytes[idx]))
-		}
-		return r
+		Array(Insecure.SHA1.hash(data: Data(self)))
 	}
 }
 

@@ -2,8 +2,6 @@
 //  NIOHTTPHandler.swift
 //  PerfectNIO
 //
-//  Created by Kyle Jessup on 2018-10-30.
-//
 //===----------------------------------------------------------------------===//
 //
 // This source file is part of the Perfect.org open source project
@@ -19,32 +17,19 @@
 import NIO
 import NIOHTTP1
 
-public extension Routes {
-	/// Run the call asynchronously on a non-event loop thread.
-	/// Caller must succeed or fail the given promise to continue the request.
-	func async<NewOut>(_ call: @escaping (OutType, EventLoopPromise<NewOut>) -> ()) -> Routes<InType, NewOut> {
-		return applyFuncs {
-			input in
-			return input.flatMap {
-				box in
-				let p: EventLoopPromise<NewOut> = input.eventLoop.makePromise()
-				foreignEventsQueue.async { call(box.value, p) }
-				return p.futureResult.map { return RouteValueBox(box.state, $0) }
-			}
-		}
-	}
-}
-
-final class NIOHTTPHandler: ChannelInboundHandler, HTTPRequest {
+// @unchecked because its mutable state is event-loop-bound; accesses from the
+// async route Task are either routed back to the event loop or are reads of
+// properties that are set once and never change (channel, isTLS).
+final class NIOHTTPHandler: ChannelInboundHandler, HTTPRequest, @unchecked Sendable {
 	public typealias InboundIn = HTTPServerRequestPart
 	public typealias OutboundOut = HTTPServerResponsePart
 	enum State {
 		case none, head, body, end
 	}
-	var method: HTTPMethod { return head?.method ?? .GET }
-	var uri: String { return head?.uri ?? "" }
-	var headers: HTTPHeaders { return head?.headers ?? .init() }
-	var uriVariables: [String:String] = [:]
+	var method: HTTPMethod { head?.method ?? .GET }
+	var uri: String { head?.uri ?? "" }
+	var headers: HTTPHeaders { head?.headers ?? .init() }
+	var uriVariables: [String: String] = [:]
 	var path: String = ""
 	var searchArgs: QueryDecoder?
 	var contentType: String? = nil
@@ -55,10 +40,10 @@ final class NIOHTTPHandler: ChannelInboundHandler, HTTPRequest {
 			assert(contentConsumed <= contentRead && contentConsumed <= contentLength)
 		}
 	}
-	var localAddress: SocketAddress? { return channel?.localAddress }
-	var remoteAddress: SocketAddress? { return channel?.remoteAddress }
-	
-	let finder: RouteFinder
+	var localAddress: SocketAddress? { channel?.localAddress }
+	var remoteAddress: SocketAddress? { channel?.remoteAddress }
+
+	let finder: any RouteFinder
 	var head: HTTPRequestHead?
 	var channel: Channel?
 	var pendingBytes: [ByteBuffer] = []
@@ -68,76 +53,66 @@ final class NIOHTTPHandler: ChannelInboundHandler, HTTPRequest {
 	var forceKeepAlive: Bool? = nil
 	var upgraded = false
 	let isTLS: Bool
-	init(finder: RouteFinder, isTLS: Bool) {
+
+	init(finder: any RouteFinder, isTLS: Bool) {
 		self.finder = finder
 		self.isTLS = isTLS
 	}
-	deinit {
-//		print("~NIOHTTPHandler")
-	}
-	
+
 	func runRequest() {
-		guard let requestHead = self.head else {
-			return
-		}
+		guard let requestHead = self.head, let channel = self.channel else { return }
 		let requestInfo = HTTPRequestInfo(head: requestHead, options: isTLS ? .isTLS : [])
 		guard let fnc = finder[requestHead.method, path] else {
-			
-			// !FIX! routes need pre-request error handlers, 404
 			let error = ErrorOutput(status: .notFound, description: "No route for URI.")
 			let head = HTTPHead(headers: HTTPHeaders()).merged(with: error.head(request: requestInfo))
 			return write(head: head, body: error)
 		}
-		let state = HandlerState(request: self, uri: path)
-		let f = channel!.eventLoop.makeSucceededFuture(RouteValueBox(state, self as HTTPRequest))
-		let p = try! fnc(f)
-		p.whenSuccess {
-			let body = $0.value
-			let head = state.responseHead.merged(with: body.head(request: requestInfo))
-			self.write(head: head, body: body)
-		}
-		p.whenFailure {
-			error in
-			var body: HTTPOutput
-			switch error {
-			case let error as TerminationType:
-				switch error {
-				case .error(let e):
-					body = e
-				case .criteriaFailed:
-					body = BytesOutput(head: state.responseHead, body: [])
-				case .internalError:
-					body = ErrorOutput(status: .internalServerError, description: "Internal server error.")
+		let ctx = RouteContext(request: self, uri: path)
+		Task {
+			do {
+				let (finalCtx, body) = try await fnc(ctx, self)
+				let head = finalCtx.responseHead.merged(with: body.head(request: requestInfo))
+				channel.eventLoop.execute {
+					self.write(head: head, body: body)
 				}
-			case let error as ErrorOutput:
-				body = error
-			default:
-				body = ErrorOutput(status: .internalServerError, description: "Internal server error: \(error)")
+			} catch {
+				let body: HTTPOutput
+				switch error {
+				case let err as TerminationType:
+					switch err {
+					case .error(let e):
+						body = e
+					case .criteriaFailed(let status):
+						body = BytesOutput(head: HTTPHead(status: status, headers: ctx.responseHeaders), body: [])
+					case .internalError:
+						body = ErrorOutput(status: .internalServerError, description: "Internal server error.")
+					}
+				case let err as ErrorOutput:
+					body = err
+				default:
+					body = ErrorOutput(status: .internalServerError, description: "Internal server error: \(error)")
+				}
+				let head = ctx.responseHead.merged(with: body.head(request: requestInfo))
+				channel.eventLoop.execute {
+					self.write(head: head, body: body)
+				}
 			}
-			let head = state.responseHead.merged(with: body.head(request: requestInfo))
-			self.write(head: head, body: body)
 		}
 	}
+
 	func channelActive(context ctx: ChannelHandlerContext) {
 		channel = ctx.channel
-//		print("channelActive")
 	}
-	func channelInactive(context ctx: ChannelHandlerContext) {
-//		print("~channelInactive")
-	}
+	func channelInactive(context ctx: ChannelHandlerContext) {}
 	func channelRead(context ctx: ChannelHandlerContext, data: NIOAny) {
 		let reqPart = unwrapInboundIn(data)
 		switch reqPart {
-		case .head(let head):
-			http(head: head, ctx: ctx)
-		case .body(let body):
-			http(body: body, ctx: ctx)
-		case .end(let headers):
-			http(end: headers, ctx: ctx)
+		case .head(let head): http(head: head, ctx: ctx)
+		case .body(let body): http(body: body, ctx: ctx)
+		case .end(let headers): http(end: headers, ctx: ctx)
 		}
 	}
 	func errorCaught(context ctx: ChannelHandlerContext, error: Error) {
-		// we don't have any recognized errors to be caught here
 		ctx.close(promise: nil)
 	}
 	func http(head: HTTPRequestHead, ctx: ChannelHandlerContext) {
@@ -154,12 +129,9 @@ final class NIOHTTPHandler: ChannelInboundHandler, HTTPRequest {
 	}
 	func http(body: ByteBuffer, ctx: ChannelHandlerContext) {
 		let onlyHead = readState == .head
-		
 		readState = .body
 		let readable = body.readableBytes
 		if contentRead + readable > contentLength {
-			// should this close the invalid request?
-			// or does NIO take care of this case?
 			let diff = contentLength - contentRead
 			if diff > 0, let s = body.getSlice(at: 0, length: diff) {
 				pendingBytes.append(s)
@@ -185,9 +157,7 @@ final class NIOHTTPHandler: ChannelInboundHandler, HTTPRequest {
 			runRequest()
 		}
 	}
-	
 	func reset() {
-		// !FIX! this. it's prone to break when future mutable properties are added
 		writeState = .none
 		readState = .none
 		head = nil
@@ -195,20 +165,14 @@ final class NIOHTTPHandler: ChannelInboundHandler, HTTPRequest {
 		contentConsumed = 0
 		contentRead = 0
 		forceKeepAlive = nil
-		
 		uriVariables = [:]
 		path = ""
 		searchArgs = nil
 		contentType = nil
 	}
-	
 	func userInboundEventTriggered(context ctx: ChannelHandlerContext, event: Any) {
 		switch event {
 		case let evt as ChannelEvent where evt == ChannelEvent.inputClosed:
-			// The remote peer half-closed the channel. At this time, any
-			// outstanding response will now get the channel closed, and
-			// if we are idle or waiting for a request body to finish we
-			// will close the channel immediately.
 			switch readState {
 			case .none, .body:
 				ctx.close(promise: nil)
@@ -219,13 +183,11 @@ final class NIOHTTPHandler: ChannelInboundHandler, HTTPRequest {
 			ctx.fireUserInboundEventTriggered(event)
 		}
 	}
-	
-	func channelReadComplete(context ctx: ChannelHandlerContext) {
-		return
-	}
+	func channelReadComplete(context ctx: ChannelHandlerContext) {}
 }
 
-// reading
+// MARK: - Reading (Future-based internals, bridged to async via protocol)
+
 extension NIOHTTPHandler {
 	func consumeContent() -> [ByteBuffer] {
 		let cpy = pendingBytes
@@ -234,49 +196,62 @@ extension NIOHTTPHandler {
 		contentConsumed += sum
 		return cpy
 	}
-	func readSomeContent() -> EventLoopFuture<[ByteBuffer]> {
+
+	// HTTPRequest async conformance — bridges to the event-loop Future implementations.
+	func readSomeContent() async throws -> [ByteBuffer] {
+		guard let ch = channel else { return [] }
+		return try await ch.eventLoop.submit {
+			() -> EventLoopFuture<[ByteBuffer]> in
+			self.readSomeContentFuture()
+		}.flatMap { $0 }.get()
+	}
+
+	func readContent() async throws -> HTTPRequestContentType {
+		guard let ch = channel else { return .none }
+		return try await ch.eventLoop.submit {
+			() -> EventLoopFuture<HTTPRequestContentType> in
+			self.readContentFuture()
+		}.flatMap { $0 }.get()
+	}
+
+	private func readSomeContentFuture() -> EventLoopFuture<[ByteBuffer]> {
 		precondition(nil != self.channel)
 		let channel = self.channel!
 		let promise: EventLoopPromise<[ByteBuffer]> = channel.eventLoop.makePromise()
-		readSomeContent(promise)
-		return promise.futureResult
-	}
-	func readSomeContent(_ promise: EventLoopPromise<[ByteBuffer]>) {
 		guard contentConsumed < contentLength else {
-			return promise.succeed([])
+			promise.succeed([])
+			return promise.futureResult
 		}
 		let content = consumeContent()
 		if !content.isEmpty {
-			return promise.succeed(content)
+			promise.succeed(content)
+		} else {
+			pendingPromise = promise
 		}
-		pendingPromise = promise
+		return promise.futureResult
 	}
-	// content can only be read once
-	func readContent() -> EventLoopFuture<HTTPRequestContentType> {
+
+	private func readContentFuture() -> EventLoopFuture<HTTPRequestContentType> {
 		if contentLength == 0 || contentConsumed == contentLength {
 			return channel!.eventLoop.makeSucceededFuture(.none)
 		}
-		let ret: EventLoopFuture<HTTPRequestContentType>
 		let ct = contentType ?? "application/octet-stream"
 		if ct.hasPrefix("multipart/form-data") {
 			let p: EventLoopPromise<HTTPRequestContentType> = channel!.eventLoop.makePromise()
-			readContent(multi: MimeReader(ct), p)
-			ret = p.futureResult
+			readContentMulti(multi: MimeReader(ct), p)
+			return p.futureResult
 		} else {
 			let p: EventLoopPromise<[UInt8]> = channel!.eventLoop.makePromise()
-			readContent(p)
+			readContentBytes(p)
 			if ct.hasPrefix("application/x-www-form-urlencoded") {
-				ret = p.futureResult.map {
-					.urlForm(QueryDecoder($0))
-				}
+				return p.futureResult.map { .urlForm(QueryDecoder($0)) }
 			} else {
-				ret = p.futureResult.map { .other($0) }
+				return p.futureResult.map { .other($0) }
 			}
 		}
-		return ret
 	}
-	
-	func readContent(multi: MimeReader, _ promise: EventLoopPromise<HTTPRequestContentType>) {
+
+	private func readContentMulti(multi: MimeReader, _ promise: EventLoopPromise<HTTPRequestContentType>) {
 		if contentConsumed < contentRead {
 			consumeContent().forEach {
 				multi.addToBuffer(bytes: $0.getBytes(at: 0, length: $0.readableBytes) ?? [])
@@ -285,70 +260,57 @@ extension NIOHTTPHandler {
 		if contentConsumed == contentLength {
 			return promise.succeed(.multiPartForm(multi))
 		}
-		readSomeContent().whenSuccess {
-			buffers in
-			buffers.forEach {
-				multi.addToBuffer(bytes: $0.getBytes(at: 0, length: $0.readableBytes) ?? [])
-			}
-			self.readContent(multi: multi, promise)
+		readSomeContentFuture().whenSuccess { buffers in
+			buffers.forEach { multi.addToBuffer(bytes: $0.getBytes(at: 0, length: $0.readableBytes) ?? []) }
+			self.readContentMulti(multi: multi, promise)
 		}
 	}
-	
-	func readContent(_ promise: EventLoopPromise<[UInt8]>) {
-		// fast track
+
+	private func readContentBytes(_ promise: EventLoopPromise<[UInt8]>) {
 		if contentRead == contentLength {
 			var a: [UInt8] = []
-			consumeContent().forEach {
-				a.append(contentsOf: $0.getBytes(at: 0, length: $0.readableBytes) ?? [])
-			}
+			consumeContent().forEach { a.append(contentsOf: $0.getBytes(at: 0, length: $0.readableBytes) ?? []) }
 			return promise.succeed(a)
 		}
-		readContent(accum: [], promise)
+		readContentBytesAccum(accum: [], promise)
 	}
-	
-	func readContent(accum: [UInt8], _ promise: EventLoopPromise<[UInt8]>) {
-		readSomeContent().whenSuccess {
-			buffers in
+
+	private func readContentBytesAccum(accum: [UInt8], _ promise: EventLoopPromise<[UInt8]>) {
+		readSomeContentFuture().whenSuccess { buffers in
 			var a: [UInt8]
 			if buffers.count == 1 && accum.isEmpty {
 				a = buffers.first!.getBytes(at: 0, length: buffers.first!.readableBytes) ?? []
 			} else {
 				a = accum
-				buffers.forEach {
-					a.append(contentsOf: $0.getBytes(at: 0, length: $0.readableBytes) ?? [])
-				}
+				buffers.forEach { a.append(contentsOf: $0.getBytes(at: 0, length: $0.readableBytes) ?? []) }
 			}
 			if self.contentConsumed == self.contentLength {
 				promise.succeed(a)
 			} else {
-				self.readContent(accum: a, promise)
+				self.readContentBytesAccum(accum: a, promise)
 			}
 		}
 	}
 }
 
-// writing
+// MARK: - Writing
+
 extension NIOHTTPHandler {
 	func write(head: HTTPHead, body: HTTPOutput) {
 		writeHead(head)
 		writeBody(body)
 	}
 	private func writeHead(_ output: HTTPHead) {
-		guard let head = head else {
-			return // …
-		}
+		guard let head = head else { return }
 		writeState = .head
-		let headers = output.headers
 		var h = HTTPResponseHead(version: head.version,
-								 status: output.status ?? .ok,
-								 headers: headers)
+		                         status: output.status ?? .ok,
+		                         headers: output.headers)
 		if !self.headers.contains(name: "keep-alive") && !self.headers.contains(name: "close") {
 			switch (head.isKeepAlive, head.version.major, head.version.minor) {
 			case (true, 1, 0):
-				// HTTP/1.0 and the request has 'Connection: keep-alive', we should mirror that
 				h.headers.add(name: "Connection", value: "keep-alive")
 			case (false, 1, let n) where n >= 1:
-				// HTTP/1.1 (or treated as such) and the request has 'Connection: close', we should mirror that
 				h.headers.add(name: "Connection", value: "close")
 			default:
 				()
@@ -357,18 +319,13 @@ extension NIOHTTPHandler {
 		channel?.write(wrapOutboundOut(.head(h)), promise: nil)
 	}
 	private func writeBody(_ body: HTTPOutput) {
-		guard let channel = self.channel,
-			writeState != .end else {
-				return
-		}
+		guard let channel = self.channel, writeState != .end else { return }
 		let promiseBytes = channel.eventLoop.makePromise(of: IOData?.self)
 		promiseBytes.futureResult.whenSuccess {
 			let writeDonePromise: EventLoopPromise<Void> = channel.eventLoop.makePromise()
 			if let bytes = $0 {
 				writeDonePromise.futureResult.whenSuccess {
-					_ = channel.eventLoop.submit {
-						self.writeBody(body)
-					}
+					_ = channel.eventLoop.submit { self.writeBody(body) }
 				}
 				if bytes.readableBytes > 0 {
 					channel.writeAndFlush(self.wrapOutboundOut(.body(bytes)), promise: writeDonePromise)
@@ -380,36 +337,23 @@ extension NIOHTTPHandler {
 				self.reset()
 				if !self.upgraded {
 					body.closed()
-					writeDonePromise.futureResult.whenComplete {
-						_ in
-						if !keepAlive {
-							channel.close(promise: nil)
-						}
+					writeDonePromise.futureResult.whenComplete { _ in
+						if !keepAlive { channel.close(promise: nil) }
 					}
 					channel.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: writeDonePromise)
 				} else {
 					channel.flush()
-				}				
+				}
 			}
-			writeDonePromise.futureResult.whenFailure {
-				error in
+			writeDonePromise.futureResult.whenFailure { _ in
 				channel.close(promise: nil)
 				body.closed()
 			}
 		}
-		promiseBytes.futureResult.whenFailure {
-			error in
+		promiseBytes.futureResult.whenFailure { _ in
 			channel.close(promise: nil)
 			body.closed()
 		}
 		body.body(promise: promiseBytes, allocator: channel.allocator)
 	}
-	
-	//	func userInboundEventTriggered(context ctx: ChannelHandlerContext, event: Any) {
-	//		if event is IdleStateHandler.IdleStateEvent {
-	//			_ = ctx.close()
-	//		} else {
-	//			ctx.fireUserInboundEventTriggered(event)
-	//		}
-	//	}
 }
