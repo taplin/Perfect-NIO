@@ -321,6 +321,57 @@ final class PerfectNIOSmokeTests: XCTestCase {
         }
     }
 
+    // MARK: - Phase 6: WebSocket
+
+    func testWebSocketEcho() async throws {
+        // /echo upgrades to WebSocket and echoes text frames back.
+        let routes = root().echo.webSocket(protocol: "echo", options: [.manualClose]) { _ -> WebSocketHandler in
+            return { ws in
+                while true {
+                    let message: WebSocketMessage
+                    do { message = try await ws.readMessage() } catch { return }
+                    switch message {
+                    case .text(let t): try? await ws.writeMessage(.text(t))
+                    case .binary(let b): try? await ws.writeMessage(.binary(b))
+                    case .close: try? await ws.writeMessage(.close); return
+                    default: break
+                    }
+                }
+            }
+        }
+        try await withServer(routes) {
+            let task = session.webSocketTask(with: URL(string: "ws://localhost:\(port)/echo")!)
+            task.resume()
+            defer { task.cancel(with: .normalClosure, reason: nil) }
+
+            try await task.send(.string("hello ws"))
+            let first = try await task.receive()
+            guard case .string(let s1) = first else { return XCTFail("expected text frame, got \(first)") }
+            XCTAssertEqual(s1, "hello ws")
+
+            // A second round-trip confirms the connection stays open and keeps echoing.
+            try await task.send(.string("again"))
+            let second = try await task.receive()
+            guard case .string(let s2) = second else { return XCTFail("expected text frame, got \(second)") }
+            XCTAssertEqual(s2, "again")
+        }
+    }
+
+    func testWebSocketRejectsNonWebSocketPath() async throws {
+        // A WebSocket handshake to a path with no webSocket() route must be refused (not 101).
+        let routes = root().echo.webSocket(protocol: "echo") { _ -> WebSocketHandler in { _ in } }
+        try await withServer(routes) {
+            let task = session.webSocketTask(with: URL(string: "ws://localhost:\(port)/not-a-socket")!)
+            task.resume()
+            do {
+                _ = try await task.receive()
+                XCTFail("handshake to non-WebSocket path should not succeed")
+            } catch {
+                // Expected: the upgrade is refused, so the task fails.
+            }
+        }
+    }
+
     // MARK: - Phase 5: idle timeout
 
     func testIdleTimeoutClosesConnection() async throws {

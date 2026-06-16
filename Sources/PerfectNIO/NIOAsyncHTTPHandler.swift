@@ -120,10 +120,10 @@ enum NIOAsyncHTTPServer {
 					//      assembleRequest returns nil, exiting the loop. The legacy handler did this
 					//      explicitly via the inputClosed ChannelEvent (forceKeepAlive=false) — confirm
 					//      the implicit stream-end path covers the same cases.
-					//   3. MISSING: there is no idle/keep-alive timeout. An idle persistent connection
-					//      holds a task + socket open indefinitely (slowloris / resource-exhaustion
-					//      risk). Add an idle-read timeout (e.g. IdleStateHandler or a withTimeout around
-					//      assembleRequest) before production.
+					//   3. Idle/keep-alive timeout: DONE in Phase 5 via `Server.idleTimeout`
+					//      (IdleStateHandler on the HTTP pipeline). Remaining hardening: a whole-request
+					//      receive deadline for slow-trickle slowloris, since the read-idle timer resets
+					//      on each byte (tracked for Phase 7).
 					if !request.isKeepAlive { break }
 				}
 			}

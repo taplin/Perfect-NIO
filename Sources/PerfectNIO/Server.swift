@@ -24,11 +24,21 @@ import NIOCore
 import NIOPosix
 import NIOHTTP1
 import NIOSSL
+import NIOWebSocket
 import NIOConcurrencyHelpers
 import Foundation
 
 typealias HTTPConnectionChannel = NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>
-typealias HTTPServerChannel = NIOAsyncChannel<HTTPConnectionChannel, Never>
+typealias WebSocketConnectionChannel = NIOAsyncChannel<WebSocketFrame, WebSocketFrame>
+// Each accepted connection resolves to one of these once the HTTP-upgrade decision is made.
+// The server channel yields the *futures* so the accept loop never blocks on a slow handshake.
+typealias HTTPServerChannel = NIOAsyncChannel<EventLoopFuture<HTTPOrWebSocket>, Never>
+
+/// The outcome of the HTTP-upgrade negotiation for one connection.
+enum HTTPOrWebSocket: Sendable {
+	case http(HTTPConnectionChannel)
+	case websocket(WebSocketConnectionChannel, WebSocketHandler, [WebSocketOption])
+}
 
 /// An HTTP(S) server for a set of routes.
 ///
@@ -123,7 +133,7 @@ public struct Server: Sendable {
 		func shutdown() async { try? await group.shutdownGracefully() }
 
 		do {
-			let channels = try await bind(group: group, sslContext: sslContext)
+			let channels = try await bind(group: group, sslContext: sslContext, finder: finder, isTLS: isTLS)
 			let boundPort = channels.first?.channel.localAddress?.port ?? port
 			try await withThrowingTaskGroup(of: Void.self) { acceptors in
 				for channel in channels {
@@ -148,9 +158,12 @@ public struct Server: Sendable {
 		}
 	}
 
-	/// Binds `reusePortCount` server channels on the configured host/port.
+	/// Binds `reusePortCount` server channels on the configured host/port. Each child channel is
+	/// configured with an HTTP pipeline that can upgrade to WebSocket (see `configureUpgrade`).
 	private func bind(group: MultiThreadedEventLoopGroup,
-	                  sslContext: NIOSSLContext?) async throws -> [HTTPServerChannel] {
+	                  sslContext: NIOSSLContext?,
+	                  finder: any RouteFinder,
+	                  isTLS: Bool) async throws -> [HTTPServerChannel] {
 		let count = max(1, reusePortCount)
 		let reusePort = count > 1
 		let idle = idleTimeout
@@ -175,17 +188,88 @@ public struct Server: Sendable {
 					if let sslContext = sslContext {
 						try childChannel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: sslContext))
 					}
-					try childChannel.pipeline.syncOperations.configureHTTPServerPipeline()
-					if let idle = idle {
-						try childChannel.pipeline.syncOperations.addHandler(IdleStateHandler(readTimeout: idle))
-						try childChannel.pipeline.syncOperations.addHandler(IdleTimeoutHandler())
-					}
-					return try HTTPConnectionChannel(wrappingChannelSynchronously: childChannel)
+					return try Server.configureUpgrade(channel: childChannel, finder: finder, isTLS: isTLS, idleTimeout: idle)
 				}
 			}
 			channels.append(channel)
 		}
 		return channels
+	}
+
+	/// Configures the child channel's HTTP pipeline with a WebSocket upgrader. Returns the future
+	/// that resolves to either a normal HTTP connection or an upgraded WebSocket connection.
+	private static func configureUpgrade(channel: Channel,
+	                                     finder: any RouteFinder,
+	                                     isTLS: Bool,
+	                                     idleTimeout: TimeAmount?) throws -> EventLoopFuture<HTTPOrWebSocket> {
+		// Shared between shouldUpgrade (writes) and upgradePipelineHandler (reads) for this one
+		// connection — both upgrader closures run sequentially on this channel's event loop.
+		let resolved = NIOLockedValueBox<(WebSocketHandler, [WebSocketOption])?>(nil)
+
+		let upgrader = NIOTypedWebSocketServerUpgrader<HTTPOrWebSocket>(
+			shouldUpgrade: { channel, head in
+				// Run the route to see if this path is a WebSocket endpoint. The upgrader itself
+				// validates Sec-WebSocket-Key/Version and computes Sec-WebSocket-Accept.
+				let promise = channel.eventLoop.makePromise(of: HTTPHeaders?.self)
+				let request = NIOAsyncHTTPRequest(head: head, body: [], channel: channel, isTLS: isTLS)
+				Task {
+					if let ws = await Server.resolveWebSocket(request, finder: finder) {
+						resolved.withLockedValue { $0 = ws }
+						promise.succeed(HTTPHeaders())
+					} else {
+						promise.succeed(nil)
+					}
+				}
+				return promise.futureResult
+			},
+			upgradePipelineHandler: { channel, _ in
+				channel.eventLoop.makeCompletedFuture {
+					let wsChannel = try WebSocketConnectionChannel(wrappingChannelSynchronously: channel)
+					let noop: WebSocketHandler = { _ in }
+					let (handler, options) = resolved.withLockedValue { $0 } ?? (noop, [])
+					return HTTPOrWebSocket.websocket(wsChannel, handler, options)
+				}
+			}
+		)
+
+		let configuration = NIOUpgradableHTTPServerPipelineConfiguration(
+			upgradeConfiguration: .init(
+				upgraders: [upgrader],
+				notUpgradingCompletionHandler: { channel in
+					channel.eventLoop.makeCompletedFuture {
+						// Idle timeout applies to plain HTTP only; WebSocket connections are
+						// long-lived and manage their own liveness.
+						if let idleTimeout = idleTimeout {
+							try channel.pipeline.syncOperations.addHandler(IdleStateHandler(readTimeout: idleTimeout))
+							try channel.pipeline.syncOperations.addHandler(IdleTimeoutHandler())
+						}
+						return HTTPOrWebSocket.http(try HTTPConnectionChannel(wrappingChannelSynchronously: channel))
+					}
+				}
+			)
+		)
+		let future = try channel.pipeline.syncOperations.configureUpgradableHTTPServerPipeline(configuration: configuration)
+		// A refused WebSocket handshake (e.g. an upgrade request to a non-WebSocket path) makes the
+		// upgrader fire `unsupportedWebSocketTarget` down the pipeline. NIO then tries to fall back
+		// to plain HTTP, but the buffered handshake request is not delivered to the async channel,
+		// so the connection would hang. Close it promptly instead — a clean rejection.
+		try channel.pipeline.syncOperations.addHandler(WebSocketUpgradeRefusalCloser())
+		return future
+	}
+
+	/// Resolves a request against the routes and, if it lands on a `webSocket(...)` route,
+	/// returns that route's handler + options. Returns nil for any non-WebSocket route.
+	private static func resolveWebSocket(_ request: NIOAsyncHTTPRequest,
+	                                     finder: any RouteFinder) async -> (WebSocketHandler, [WebSocketOption])? {
+		guard let fnc = finder[request.method, request.path] else { return nil }
+		let ctx = RouteContext(request: request, uri: request.path)
+		do {
+			let (_, output) = try await fnc(ctx, request)
+			guard let wsOutput = output as? WebSocketUpgradeHTTPOutput else { return nil }
+			return (wsOutput.handler, wsOutput.options)
+		} catch {
+			return nil
+		}
 	}
 
 	/// Accept loop for one server channel: each accepted connection is handled in its own child
@@ -196,15 +280,31 @@ public struct Server: Sendable {
 		do {
 			try await withThrowingDiscardingTaskGroup { connections in
 				try await serverChannel.executeThenClose { inbound in
-					for try await connectionChannel in inbound {
+					for try await upgradeResult in inbound {
 						connections.addTask {
-							await NIOAsyncHTTPServer.handleConnection(connectionChannel, finder: finder, isTLS: isTLS)
+							await Server.handleConnection(upgradeResult, finder: finder, isTLS: isTLS)
 						}
 					}
 				}
 			}
 		} catch {
 			// Server channel closed (cancellation / shutdown) or the accept loop failed.
+		}
+	}
+
+	/// Awaits one connection's upgrade outcome and dispatches it to the right driver.
+	private static func handleConnection(_ upgradeResult: EventLoopFuture<HTTPOrWebSocket>,
+	                                     finder: any RouteFinder,
+	                                     isTLS: Bool) async {
+		do {
+			switch try await upgradeResult.get() {
+			case .http(let channel):
+				await NIOAsyncHTTPServer.handleConnection(channel, finder: finder, isTLS: isTLS)
+			case .websocket(let channel, let handler, let options):
+				await WebSocketRunner.run(channel, handler: handler, options: options)
+			}
+		} catch {
+			// Upgrade negotiation failed or the connection errored before producing a result.
 		}
 	}
 }
@@ -224,6 +324,20 @@ private final class IdleTimeoutHandler: ChannelInboundHandler {
 			context.close(promise: nil)
 		} else {
 			context.fireUserInboundEventTriggered(event)
+		}
+	}
+}
+
+/// Closes a connection whose WebSocket upgrade was refused. The typed upgrader fires a
+/// `NIOWebSocketUpgradeError` down the pipeline and then attempts an HTTP fall-back that does not
+/// deliver the buffered handshake request to the async channel — so we close rather than hang.
+private final class WebSocketUpgradeRefusalCloser: ChannelInboundHandler {
+	typealias InboundIn = NIOAny
+	func errorCaught(context: ChannelHandlerContext, error: Error) {
+		if error is NIOWebSocketUpgradeError {
+			context.close(promise: nil)
+		} else {
+			context.fireErrorCaught(error)
 		}
 	}
 }
