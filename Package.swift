@@ -18,6 +18,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio-extras.git", from: "1.21.0"),
         .package(url: "https://github.com/PerfectlySoft/Perfect-Mustache.git", from: "4.0.0"),
         .package(path: "../Perfect-CRUD"),
+        .package(path: "../Perfect-MySQL"),
     ],
     targets: [
         // Local system library wrapping libz — replaces PerfectCZlib
@@ -70,6 +71,15 @@ let package = Package(
                 "PerfectNIO",
                 .product(name: "NIO", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
+            ]
+        ),
+        .testTarget(
+            name: "PerfectNIOMySQLTests",
+            dependencies: [
+                "PerfectNIO",
+                "PerfectNIOCRUD",
+                .product(name: "PerfectCRUD", package: "Perfect-CRUD"),
+                .product(name: "PerfectMySQL", package: "Perfect-MySQL"),
             ]
         ),
     ]
