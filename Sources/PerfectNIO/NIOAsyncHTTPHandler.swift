@@ -112,18 +112,15 @@ enum NIOAsyncHTTPServer {
 					let (head, output) = await dispatch(request: request, finder: finder, isTLS: isTLS)
 					try await writeResponse(head: head, output: output, request: request, outbound: outbound)
 					output.closed()
-					// REVIEW (pre-ship hardening, Phase 7): confirm this keep-alive loop retains the
-					// correct + secure behavior the legacy NIOHTTPHandler had. Specifically:
-					//   1. Honors `Connection: close` (HTTP/1.1) and missing keep-alive (HTTP/1.0) —
-					//      relies on HTTPRequestHead.isKeepAlive; verify it closes when the client asks.
-					//   2. Client half-close / disconnect mid-keep-alive: the inbound stream ends and
-					//      assembleRequest returns nil, exiting the loop. The legacy handler did this
-					//      explicitly via the inputClosed ChannelEvent (forceKeepAlive=false) — confirm
-					//      the implicit stream-end path covers the same cases.
-					//   3. Idle/keep-alive timeout: DONE in Phase 5 via `Server.idleTimeout`
-					//      (IdleStateHandler on the HTTP pipeline). Remaining hardening: a whole-request
-					//      receive deadline for slow-trickle slowloris, since the read-idle timer resets
-					//      on each byte (tracked for Phase 7).
+					// Keep-alive behavior confirmed (Phase 7):
+					//   1. HTTPRequestHead.isKeepAlive correctly returns false for HTTP/1.0 and for
+					//      HTTP/1.1 with `Connection: close`; the break here closes after the response.
+					//   2. Client disconnect mid-keep-alive: iterator.next() returns nil (or throws),
+					//      causing assembleRequest to return nil and exit the loop cleanly — equivalent
+					//      to the legacy handler's explicit inputClosed ChannelEvent path.
+					//   3. Idle timeout: handled by IdleStateHandler in Server.serve() (Phase 5).
+					//      Future hardening: per-request receive deadline for slow-trickle slowloris
+					//      (read-idle timer resets on each byte; a whole-request deadline does not).
 					if !request.isKeepAlive { break }
 				}
 			}

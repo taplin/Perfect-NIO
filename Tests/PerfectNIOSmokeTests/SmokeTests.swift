@@ -72,16 +72,13 @@ final class PerfectNIOSmokeTests: XCTestCase {
     // MARK: - Pure unit test (no server needed)
 
     func testQueryDecoder() {
-        // sentinel=x ensures empty= is not the last token — QueryDecoder stores the name
-        // including the "=" when the key=value pair is at the very end of the string.
-        let q = QueryDecoder(Array("a=1&b=2&b=3&novalue&empty=&sentinel=x".utf8))
+        // Covers: multi-value keys, key& (no value), key= at end of string (previously buggy —
+        // was stored as "key=" in the lookup map, making q["key"] return []).
+        let q = QueryDecoder(Array("a=1&b=2&b=3&novalue&empty=".utf8))
         XCTAssertEqual(q["a"], ["1"])
         XCTAssertEqual(q["b"], ["2", "3"])
-        // Key with no "=" followed by "&" → one empty-string value
-        XCTAssertEqual(q["novalue"], [""])
-        // Key with "=" and empty value (not at end of string) → one empty-string value
-        XCTAssertEqual(q["empty"], [""])
-        XCTAssertEqual(q["sentinel"], ["x"])
+        XCTAssertEqual(q["novalue"], [""])  // key& → empty-string value
+        XCTAssertEqual(q["empty"], [""])    // key= at end of string → empty-string value
         XCTAssertEqual(q["missing"], [])
     }
 
@@ -409,6 +406,76 @@ final class PerfectNIOSmokeTests: XCTestCase {
         try channel.writeAndFlush(buf).wait()
         defer { try? channel.close().wait() }
         return try promise.futureResult.wait()
+    }
+
+    // MARK: - Phase 7: gap coverage from old test suite
+
+    /// .ext("json") matches /path.json and 404s /path; same base route serves both extensions.
+    func testPathExtension() async throws {
+        struct Payload: Codable { let value: Int }
+        let base = root().data { Payload(value: 99) }
+        let routes = try root().dir(
+            base.ext("json").json(),
+            base.ext("txt").map { "\($0.value)" }.text()
+        )
+        try await withServer(routes) {
+            let (data, r1) = try await get("/data.json")
+            XCTAssertEqual(r1.statusCode, 200)
+            let decoded = try JSONDecoder().decode(Payload.self, from: data)
+            XCTAssertEqual(decoded.value, 99)
+
+            let (data2, r2) = try await get("/data.txt")
+            XCTAssertEqual(r2.statusCode, 200)
+            XCTAssertEqual(String(data: data2, encoding: .utf8), "99")
+
+            let (_, r3) = try await get("/data")
+            XCTAssertEqual(r3.statusCode, 404)
+        }
+    }
+
+    /// .request { out, req in } gives the handler access to the HTTPRequest object.
+    func testRequestAccess() async throws {
+        let routes = root().ping.request { _, req in req.path }.text()
+        try await withServer(routes) {
+            let (data, response) = try await get("/ping")
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), "/ping")
+        }
+    }
+
+    /// routes.describe lists the URI key for every registered route.
+    func testDescribeRoutes() throws {
+        let routes = try root().dir(
+            root().a.b { "ab" },
+            root().GET.c { "c" },
+            root().wild(name: "x").d { "d" }
+        ).text()
+        let uris = Set(routes.describe.map(\.uri))
+        XCTAssertTrue(uris.contains("/a/b"), "missing /a/b in \(uris)")
+        XCTAssertTrue(uris.contains("GET:///c"), "missing GET:///c in \(uris)")
+        XCTAssertTrue(uris.contains("/*/d"), "missing /*/d in \(uris)")
+    }
+
+    /// statusCheck + unwrap compose into an auth gate: missing token → 401, valid token → 200.
+    func testAuthPattern() async throws {
+        struct AuthSession: Sendable { let username: String }
+        let routes: Routes<HTTPRequest, HTTPOutput> = root { req -> AuthSession? in
+                req.headers["X-Auth-Token"].first == "secret" ? AuthSession(username: "alice") : nil
+            }
+            .statusCheck { $0 == nil ? .unauthorized : .ok }
+            .unwrap { $0 }
+            .request { auth, _ in auth.username }
+            .text()
+        try await withServer(routes) {
+            let (_, r1) = try await get("/")
+            XCTAssertEqual(r1.statusCode, 401)
+
+            var authReq = URLRequest(url: url("/"))
+            authReq.addValue("secret", forHTTPHeaderField: "X-Auth-Token")
+            let (data, r2) = try await session.data(for: authReq)
+            XCTAssertEqual((r2 as! HTTPURLResponse).statusCode, 200)
+            XCTAssertEqual(String(data: data, encoding: .utf8), "alice")
+        }
     }
 
     // MARK: - Phase 5: idle timeout
