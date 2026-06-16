@@ -18,36 +18,30 @@
 
 import Foundation
 import PerfectCRUD
-import Dispatch
 import NIO
 import PerfectNIO
 
 public typealias DCP = DatabaseConfigurationProtocol
 
 public extension Routes {
-	func db<C: DCP, NewOut>(_ provide: @autoclosure @escaping () throws -> Database<C>,
-					_ call: @escaping (OutType, Database<C>) throws -> NewOut) -> Routes<InType, NewOut> {
-		return self.async {
-			i, promise in
-			do {
-				let db = try provide()
-				promise.succeed(try call(i, db))
-			} catch {
-				promise.fail(error)
-			}
-		}
-	}
-	func table<C: DCP, T: Codable, NewOut>(_ provide: @autoclosure @escaping () throws -> Database<C>,
-										   _ type: T.Type,
-										   _ call: @escaping (OutType, Table<T, Database<C>>) throws -> NewOut) -> Routes<InType, NewOut> {
-		return self.async {
-			i, promise in
-			do {
-				let table = try provide().table(type)
-				promise.succeed(try call(i, table))
-			} catch {
-				promise.fail(error)
-			}
-		}
-	}
+    func db<C: DCP & Sendable, NewOut>(
+        _ provide: @autoclosure @escaping @Sendable () throws -> Database<C>,
+        _ call: @Sendable @escaping (OutType, Database<C>) async throws -> NewOut
+    ) -> Routes<InType, NewOut> {
+        map { input in
+            let db = try provide()
+            return try await call(input, db)
+        }
+    }
+
+    func table<C: DCP & Sendable, T: Codable & Sendable, NewOut>(
+        _ provide: @autoclosure @escaping @Sendable () throws -> Database<C>,
+        _ type: T.Type,
+        _ call: @Sendable @escaping (OutType, Table<T, Database<C>>) async throws -> NewOut
+    ) -> Routes<InType, NewOut> {
+        map { input in
+            let table = try provide().table(type)
+            return try await call(input, table)
+        }
+    }
 }

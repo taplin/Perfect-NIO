@@ -10,16 +10,14 @@ let package = Package(
         .executable(name: "PerfectNIOExe", targets: ["PerfectNIOExe"]),
         .library(name: "PerfectNIO", targets: ["PerfectNIO"]),
         .library(name: "PerfectNIOMustache", targets: ["PerfectNIOMustache"]),
-        // PerfectNIOCRUD disabled — uses removed .async{} API; restore in Phase 7
-        // .library(name: "PerfectNIOCRUD", targets: ["PerfectNIOCRUD"]),
+        .library(name: "PerfectNIOCRUD", targets: ["PerfectNIOCRUD"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.0"),
         .package(url: "https://github.com/apple/swift-nio-extras.git", from: "1.21.0"),
-        // Optional target dependencies — these libraries are pre-Swift-6 and compile in their own language mode
         .package(url: "https://github.com/PerfectlySoft/Perfect-Mustache.git", from: "4.0.0"),
-        .package(url: "https://github.com/PerfectlySoft/Perfect-CRUD.git", from: "2.0.0"),
+        .package(path: "../Perfect-CRUD"),
     ],
     targets: [
         // Local system library wrapping libz — replaces PerfectCZlib
@@ -58,15 +56,14 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
             ]
         ),
-        // PerfectNIOCRUD disabled — uses removed .async{} API; restore in Phase 7
-        // .target(
-        //     name: "PerfectNIOCRUD",
-        //     dependencies: [
-        //         "PerfectNIO",
-        //         .product(name: "PerfectCRUD", package: "Perfect-CRUD"),
-        //         .product(name: "NIO", package: "swift-nio"),
-        //     ]
-        // ),
+        .target(
+            name: "PerfectNIOCRUD",
+            dependencies: [
+                "PerfectNIO",
+                .product(name: "PerfectCRUD", package: "Perfect-CRUD"),
+                .product(name: "NIO", package: "swift-nio"),
+            ]
+        ),
         .testTarget(
             name: "PerfectNIOSmokeTests",
             dependencies: [
