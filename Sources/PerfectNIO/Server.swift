@@ -202,25 +202,17 @@ public struct Server: Sendable {
 	                                     finder: any RouteFinder,
 	                                     isTLS: Bool,
 	                                     idleTimeout: TimeAmount?) throws -> EventLoopFuture<HTTPOrWebSocket> {
-		// Shared between shouldUpgrade (writes) and upgradePipelineHandler (reads) for this one
-		// connection — both upgrader closures run sequentially on this channel's event loop.
+		// Populated by the pre-upgrade router (below) before the typed upgrader runs, so the
+		// upgrader and its pipeline handler can read the resolved handler synchronously.
 		let resolved = NIOLockedValueBox<(WebSocketHandler, [WebSocketOption])?>(nil)
 
 		let upgrader = NIOTypedWebSocketServerUpgrader<HTTPOrWebSocket>(
-			shouldUpgrade: { channel, head in
-				// Run the route to see if this path is a WebSocket endpoint. The upgrader itself
-				// validates Sec-WebSocket-Key/Version and computes Sec-WebSocket-Accept.
-				let promise = channel.eventLoop.makePromise(of: HTTPHeaders?.self)
-				let request = NIOAsyncHTTPRequest(head: head, body: [], channel: channel, isTLS: isTLS)
-				Task {
-					if let ws = await Server.resolveWebSocket(request, finder: finder) {
-						resolved.withLockedValue { $0 = ws }
-						promise.succeed(HTTPHeaders())
-					} else {
-						promise.succeed(nil)
-					}
-				}
-				return promise.futureResult
+			shouldUpgrade: { channel, _ in
+				// The router only forwards a handshake here (Upgrade header intact) once it has
+				// confirmed the path is a WebSocket route and stored the handler — so accept iff
+				// that happened. The upgrader validates Sec-WebSocket-* and computes the accept key.
+				let accept = resolved.withLockedValue { $0 } != nil
+				return channel.eventLoop.makeSucceededFuture(accept ? HTTPHeaders() : nil)
 			},
 			upgradePipelineHandler: { channel, _ in
 				channel.eventLoop.makeCompletedFuture {
@@ -232,35 +224,58 @@ public struct Server: Sendable {
 			}
 		)
 
-		let configuration = NIOUpgradableHTTPServerPipelineConfiguration(
-			upgradeConfiguration: .init(
-				upgraders: [upgrader],
-				notUpgradingCompletionHandler: { channel in
-					channel.eventLoop.makeCompletedFuture {
-						// Idle timeout applies to plain HTTP only; WebSocket connections are
-						// long-lived and manage their own liveness.
-						if let idleTimeout = idleTimeout {
-							try channel.pipeline.syncOperations.addHandler(IdleStateHandler(readTimeout: idleTimeout))
-							try channel.pipeline.syncOperations.addHandler(IdleTimeoutHandler())
-						}
-						return HTTPOrWebSocket.http(try HTTPConnectionChannel(wrappingChannelSynchronously: channel))
+		let upgradeConfiguration = NIOTypedHTTPServerUpgradeConfiguration<HTTPOrWebSocket>(
+			upgraders: [upgrader],
+			notUpgradingCompletionHandler: { channel in
+				channel.eventLoop.makeCompletedFuture {
+					// Idle timeout applies to plain HTTP only; WebSocket connections are
+					// long-lived and manage their own liveness.
+					if let idleTimeout = idleTimeout {
+						try channel.pipeline.syncOperations.addHandler(IdleStateHandler(readTimeout: idleTimeout))
+						try channel.pipeline.syncOperations.addHandler(IdleTimeoutHandler())
 					}
+					return HTTPOrWebSocket.http(try HTTPConnectionChannel(wrappingChannelSynchronously: channel))
 				}
-			)
+			}
 		)
-		let future = try channel.pipeline.syncOperations.configureUpgradableHTTPServerPipeline(configuration: configuration)
-		// A refused WebSocket handshake (e.g. an upgrade request to a non-WebSocket path) makes the
-		// upgrader fire `unsupportedWebSocketTarget` down the pipeline. NIO then tries to fall back
-		// to plain HTTP, but the buffered handshake request is not delivered to the async channel,
-		// so the connection would hang. Close it promptly instead — a clean rejection.
-		try channel.pipeline.syncOperations.addHandler(WebSocketUpgradeRefusalCloser())
-		return future
+
+		// We build the upgradable HTTP pipeline by hand (rather than
+		// `configureUpgradableHTTPServerPipeline`) so the pre-upgrade router can sit *between* the
+		// request decoder and the upgrade handler. This is what makes a refused upgrade behave
+		// correctly per RFC 6455 §4.2.2: the router strips the `Upgrade` header for non-WebSocket
+		// paths, so NIO serves the request as ordinary HTTP and the route's real status (e.g. 404)
+		// is returned, instead of the request being discarded by the upgrader.
+		let sync = channel.pipeline.syncOperations
+		let responseEncoder = HTTPResponseEncoder()
+		let requestDecoder = ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .forwardBytes))
+		var extraHTTPHandlers: [RemovableChannelHandler] = [requestDecoder]
+		try sync.addHandler(responseEncoder)
+		try sync.addHandler(requestDecoder)
+		let pipeliningHandler = HTTPServerPipelineHandler()
+		try sync.addHandler(pipeliningHandler)
+		extraHTTPHandlers.append(pipeliningHandler)
+		let headerValidator = NIOHTTPResponseHeadersValidator()
+		try sync.addHandler(headerValidator)
+		extraHTTPHandlers.append(headerValidator)
+		let errorHandler = HTTPServerProtocolErrorHandler()
+		try sync.addHandler(errorHandler)
+		extraHTTPHandlers.append(errorHandler)
+
+		try sync.addHandler(WebSocketUpgradeRouter(finder: finder, isTLS: isTLS, resolved: resolved))
+
+		let upgradeHandler = NIOTypedHTTPServerUpgradeHandler(
+			httpEncoder: responseEncoder,
+			extraHTTPHandlers: extraHTTPHandlers,
+			upgradeConfiguration: upgradeConfiguration
+		)
+		try sync.addHandler(upgradeHandler)
+		return upgradeHandler.upgradeResultFuture
 	}
 
 	/// Resolves a request against the routes and, if it lands on a `webSocket(...)` route,
 	/// returns that route's handler + options. Returns nil for any non-WebSocket route.
-	private static func resolveWebSocket(_ request: NIOAsyncHTTPRequest,
-	                                     finder: any RouteFinder) async -> (WebSocketHandler, [WebSocketOption])? {
+	fileprivate static func resolveWebSocket(_ request: NIOAsyncHTTPRequest,
+	                                         finder: any RouteFinder) async -> (WebSocketHandler, [WebSocketOption])? {
 		guard let fnc = finder[request.method, request.path] else { return nil }
 		let ctx = RouteContext(request: request, uri: request.path)
 		do {
@@ -328,17 +343,97 @@ private final class IdleTimeoutHandler: ChannelInboundHandler {
 	}
 }
 
-/// Closes a connection whose WebSocket upgrade was refused. The typed upgrader fires a
-/// `NIOWebSocketUpgradeError` down the pipeline and then attempts an HTTP fall-back that does not
-/// deliver the buffered handshake request to the async channel — so we close rather than hang.
-private final class WebSocketUpgradeRefusalCloser: ChannelInboundHandler {
-	typealias InboundIn = NIOAny
-	func errorCaught(context: ChannelHandlerContext, error: Error) {
-		if error is NIOWebSocketUpgradeError {
-			context.close(promise: nil)
-		} else {
-			context.fireErrorCaught(error)
+/// Sits between the HTTP request decoder and the typed WebSocket upgrade handler. For a request
+/// that carries an `Upgrade: websocket` header, it resolves the route first:
+///   - if the path is a real `webSocket(...)` route, it stores the handler and forwards the
+///     handshake unchanged so the upgrade proceeds;
+///   - otherwise it strips the WebSocket headers and forwards the request as ordinary HTTP, so the
+///     route's natural response (e.g. 404) is returned — the spec-compliant behavior (RFC 6455
+///     §4.2.2 / §1.3) and what mainstream WebSocket servers do.
+///
+/// This is necessary because NIO's typed upgrade handler discards a refused upgrade request rather
+/// than serving it as HTTP, so the decision must be made before it sees the request.
+/// `@unchecked Sendable`: lives on and is only touched on its channel's event loop.
+private final class WebSocketUpgradeRouter: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
+	typealias InboundIn = HTTPServerRequestPart
+	typealias InboundOut = HTTPServerRequestPart
+
+	private enum State { case awaitingHead, resolving, passthrough }
+	private var state: State = .awaitingHead
+	private var buffered: [HTTPServerRequestPart] = []
+	private let finder: any RouteFinder
+	private let isTLS: Bool
+	private let resolved: NIOLockedValueBox<(WebSocketHandler, [WebSocketOption])?>
+
+	init(finder: any RouteFinder, isTLS: Bool, resolved: NIOLockedValueBox<(WebSocketHandler, [WebSocketOption])?>) {
+		self.finder = finder
+		self.isTLS = isTLS
+		self.resolved = resolved
+	}
+
+	func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+		switch state {
+		case .passthrough:
+			context.fireChannelRead(data)
+		case .resolving:
+			buffered.append(Self.unwrapInboundIn(data))
+		case .awaitingHead:
+			let part = Self.unwrapInboundIn(data)
+			guard case .head(let head) = part, Self.isWebSocketUpgrade(head) else {
+				// Not a WebSocket handshake; this connection is plain HTTP from here on.
+				state = .passthrough
+				context.fireChannelRead(data)
+				return
+			}
+			state = .resolving
+			buffered.append(part)
+			resolve(context: context, head: head)
 		}
+	}
+
+	private func resolve(context: ChannelHandlerContext, head: HTTPRequestHead) {
+		let boundContext = NIOLoopBoundBox(context, eventLoop: context.eventLoop)
+		let request = NIOAsyncHTTPRequest(head: head, body: [], channel: context.channel, isTLS: isTLS)
+		let finder = self.finder
+		let resolved = self.resolved
+		Task {
+			let ws = await Server.resolveWebSocket(request, finder: finder)
+			boundContext.eventLoop.execute {
+				if let ws = ws { resolved.withLockedValue { $0 = ws } }
+				self.flush(context: boundContext.value, stripUpgrade: ws == nil)
+			}
+		}
+	}
+
+	/// Re-fire the buffered handshake (optionally with WebSocket headers removed), then remove self.
+	private func flush(context: ChannelHandlerContext, stripUpgrade: Bool) {
+		for part in buffered {
+			if stripUpgrade, case .head(var head) = part {
+				Self.removeWebSocketHeaders(&head)
+				context.fireChannelRead(Self.wrapInboundOut(.head(head)))
+			} else {
+				context.fireChannelRead(Self.wrapInboundOut(part))
+			}
+		}
+		buffered.removeAll()
+		context.fireChannelReadComplete()
+		state = .passthrough
+		context.pipeline.syncOperations.removeHandler(self, promise: nil)
+	}
+
+	private static func isWebSocketUpgrade(_ head: HTTPRequestHead) -> Bool {
+		head.headers[canonicalForm: "upgrade"].contains { $0.lowercased() == "websocket" }
+	}
+
+	private static func removeWebSocketHeaders(_ head: inout HTTPRequestHead) {
+		for name in ["Upgrade", "Sec-WebSocket-Key", "Sec-WebSocket-Version",
+		             "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions"] {
+			head.headers.remove(name: name)
+		}
+		// Drop only the "upgrade" token from Connection, preserving any others (e.g. keep-alive).
+		let remaining = head.headers[canonicalForm: "connection"].filter { $0.lowercased() != "upgrade" }
+		head.headers.remove(name: "Connection")
+		for value in remaining { head.headers.add(name: "Connection", value: String(value)) }
 	}
 }
 

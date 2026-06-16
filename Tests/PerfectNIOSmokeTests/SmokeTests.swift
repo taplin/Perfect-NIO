@@ -14,6 +14,8 @@
 import XCTest
 import Foundation
 import NIO
+import NIOCore
+import NIOPosix
 import NIOHTTP1
 @testable import PerfectNIO
 
@@ -358,18 +360,55 @@ final class PerfectNIOSmokeTests: XCTestCase {
     }
 
     func testWebSocketRejectsNonWebSocketPath() async throws {
-        // A WebSocket handshake to a path with no webSocket() route must be refused (not 101).
+        // A WebSocket handshake to a path with no webSocket() route must NOT upgrade, and — per
+        // RFC 6455 §4.2.2 / §1.3 — must be served as ordinary HTTP with the route's natural status
+        // (here 404), not closed or hung. URLSession's WS task can't surface the status, so we send
+        // the raw handshake and assert the HTTP response line.
         let routes = root().echo.webSocket(protocol: "echo") { _ -> WebSocketHandler in { _ in } }
         try await withServer(routes) {
-            let task = session.webSocketTask(with: URL(string: "ws://localhost:\(port)/not-a-socket")!)
-            task.resume()
-            do {
-                _ = try await task.receive()
-                XCTFail("handshake to non-WebSocket path should not succeed")
-            } catch {
-                // Expected: the upgrade is refused, so the task fails.
-            }
+            let handshake = """
+            GET /not-a-socket HTTP/1.1\r
+            Host: localhost\r
+            Connection: Upgrade\r
+            Upgrade: websocket\r
+            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r
+            Sec-WebSocket-Version: 13\r
+            \r
+
+            """
+            let response = try rawExchange(port: port, request: handshake)
+            XCTAssertTrue(response.hasPrefix("HTTP/1.1 404"), "expected HTTP 404, got: \(response.prefix(40))")
+            XCTAssertFalse(response.contains("101 Switching Protocols"), "must not upgrade a non-WebSocket path")
         }
+    }
+
+    /// Opens a raw TCP connection to `port`, sends `request`, and returns the response up to the
+    /// end of the headers (or until the peer closes). Used to inspect raw HTTP status lines.
+    private func rawExchange(port: Int, request: String, timeout: TimeAmount = .seconds(3)) throws -> String {
+        final class Collector: ChannelInboundHandler, @unchecked Sendable {
+            typealias InboundIn = ByteBuffer
+            let promise: EventLoopPromise<String>
+            var acc = ""
+            init(_ p: EventLoopPromise<String>) { promise = p }
+            func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+                var buf = Self.unwrapInboundIn(data)
+                acc += buf.readString(length: buf.readableBytes) ?? ""
+                if acc.contains("\r\n\r\n") { promise.succeed(acc) }
+            }
+            func channelInactive(context: ChannelHandlerContext) { promise.succeed(acc) }
+        }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        let promise = group.next().makePromise(of: String.self)
+        group.next().scheduleTask(in: timeout) { promise.fail(ServerError("rawExchange timed out")) }
+        let channel = try ClientBootstrap(group: group)
+            .channelInitializer { ch in ch.pipeline.addHandler(Collector(promise)) }
+            .connect(host: "127.0.0.1", port: port).wait()
+        var buf = channel.allocator.buffer(capacity: request.utf8.count)
+        buf.writeString(request)
+        try channel.writeAndFlush(buf).wait()
+        defer { try? channel.close().wait() }
+        return try promise.futureResult.wait()
     }
 
     // MARK: - Phase 5: idle timeout
