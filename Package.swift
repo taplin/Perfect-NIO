@@ -20,8 +20,6 @@ let package = Package(
         // Optional target dependencies — these libraries are pre-Swift-6 and compile in their own language mode
         .package(url: "https://github.com/PerfectlySoft/Perfect-Mustache.git", from: "4.0.0"),
         .package(url: "https://github.com/PerfectlySoft/Perfect-CRUD.git", from: "2.0.0"),
-        // Test dependency — PerfectCURL was already fixed in this resurrection effort
-        .package(path: "../Perfect-CURL"),
     ],
     targets: [
         // Local system library wrapping libz — replaces PerfectCZlib
@@ -69,19 +67,6 @@ let package = Package(
         //         .product(name: "NIO", package: "swift-nio"),
         //     ]
         // ),
-        // PerfectNIOTests is kept as historical reference but not compiled —
-        // it imports removed packages (PerfectCRUD, PerfectLib, PerfectCURL) and
-        // uses the old EventLoopFuture-based API that Phase 2+3 replaced.
-        // Restore this target in Phase 7 when the test suite is rewritten.
-        // .testTarget(
-        //     name: "PerfectNIOTests",
-        //     dependencies: [
-        //         "PerfectNIO",
-        //         .product(name: "PerfectCURL", package: "Perfect-CURL"),
-        //     ]
-        // ),
-        // New smoke tests — no external deps, uses URLSession for HTTP.
-        // Validates Phase 2+3 async route chain and HTTPOutput.nextChunk() end-to-end.
         .testTarget(
             name: "PerfectNIOSmokeTests",
             dependencies: [
