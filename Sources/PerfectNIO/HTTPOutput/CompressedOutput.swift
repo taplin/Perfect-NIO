@@ -23,6 +23,9 @@
 import Foundation
 import NIOHTTP1
 import CZlib
+import Logging
+
+private let logger = Logger(label: "perfect.nio.compressedoutput")
 import NIO
 
 internal extension String {
@@ -176,7 +179,7 @@ public class CompressedOutput: HTTPOutput, @unchecked Sendable {
 					stream.avail_in = UInt32(readable)
 					let rc = deflate(&stream, Z_NO_FLUSH)
 					if rc != Z_OK || stream.avail_in != 0 {
-						debugPrint("deflate rc \(rc)")
+						logger.debug("deflate returned rc \(rc)")
 					}
 					return readable - Int(stream.avail_in)
 				}

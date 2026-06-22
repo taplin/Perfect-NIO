@@ -19,6 +19,9 @@
 
 import Foundation
 import Darwin
+import Logging
+
+private let logger = Logger(label: "perfect.nio.mimereader")
 
 enum MimeReadState {
 	case stateNone
@@ -350,7 +353,7 @@ public final class MimeReader {
 						let length = writeEnd - position
 						spec.fileSize += try spec.file!.write(bytes: byts, dataPosition: position, length: length)
 					} catch let e {
-						print("Exception while writing file upload data: \(e)")
+						logger.error("exception while writing file upload data: \(e)")
 						state = .stateNone
 						break
 					}
