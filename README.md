@@ -1,831 +1,650 @@
 <p align="center">
     <a href="https://developer.apple.com/swift/" target="_blank">
-        <img src="https://img.shields.io/badge/Swift-5.0-orange.svg?style=flat" alt="Swift 5.0">
+        <img src="https://img.shields.io/badge/Swift-6.0-orange.svg?style=flat" alt="Swift 6.0">
     </a>
     <a href="https://developer.apple.com/swift/" target="_blank">
-        <img src="https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux%20-lightgray.svg?style=flat" alt="Platforms macOS | Linux">
+        <img src="https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux-lightgray.svg?style=flat" alt="Platforms macOS | Linux">
     </a>
     <a href="http://perfect.org/licensing.html" target="_blank">
         <img src="https://img.shields.io/badge/License-Apache-lightgrey.svg?style=flat" alt="License Apache">
     </a>
 </p>
 
-# Perfect 4 NIO
+# PerfectNIO
 
-This project is a work in progress and should be considered **alpha quality** until this sentence is removed.
+A Swift 6 HTTP(S) server library built on SwiftNIO. Routes are a composable, strongly-typed pipeline: each step accepts one type and produces another, terminating in an `HTTPOutput` that writes the response. The library is an updated resurrection of the original [Perfect-NIO](https://github.com/PerfectlySoft/Perfect-NIO) project.
 
-<a href="#usage">Package.swift Usage</a>
+- [Quick start](#quick-start)
+- [Package.swift](#packageswift)
+- [Routing](#routing)
+- [Route operations](#route-operations)
+- [HTTP methods](#http-methods)
+- [Output types](#output-types)
+- [Custom HTTPOutput](#custom-httpoutput)
+- [WebSocket](#websocket)
+- [TLS / HTTPS](#tls--https)
+- [Reference](#reference)
+- [Linux support](#linux-support)
 
-### Intro
+---
 
-Perfect 4 NIO is a Swift based API server. It provides the ability to serve HTTP/S endpoints by creating one or more URI based routes and binding them to a port. Each route is built as a series of operations, each accepting and returning some sort of value. A route finally terminates and outputs to the client by returning an `HTTPOutput` object.
-
-### Simple Routing
+## Quick start
 
 ```swift
-root { "Hello, world!" }.text()
+// Sources/MyServer/main.swift
+import PerfectNIO
+
+let routes = root { "Hello, world!" }.text()
+try await Server(routes: routes, port: 8080).run()
 ```
 
-This simple route would be applied to the root `/` of the server. It accepts nothing, Void, but returns a String. That string would be returned to the client with the text/plain content type.
+Build and run with `swift run`. The server listens on port 8080 and responds to every request with `Hello, world!`.
 
-However, that bit of code produces an unused value. To serve a route you must first bind it to a port, ask it to listen for requests, then (optionally) wait until the process is terminated.
-
-```swift
-try root { "Hello, world!" }.text().bind(port: 8080).listen().wait()
-```
-
-This will create a route and bind it to port 8080. It will then serve HTTP clients on that port until the process exits.
-
-Each of these steps can be broken up as nessesary.
+### Scoped server (useful in tests)
 
 ```swift
-let route = root { "Hello, world!" }
-let textOutput = route.text()
-let boundServer = try textOutput.bind(port: 8080)
-let listeningServer = try boundServer.listen()
-try listeningServer.wait()	
-```
-
-### Root
-
-The `root` function is used to create a route beginning with `/`. The root is, by default, a function accepting an <a href="#httprequest">`HTTPRequest`</a> and returning an `HTTPRequest`; an identity function. There are a few other variants of the `root` func. These are listed here: <a href="#rooot">root</a>.
-
-The type of object returned by `root` is a `Routes` object. Routes is defined simply as:
-
-```swift
-public struct Routes<InType, OutType> {}
-```
-
-A `Routes` object encompasses one or more paths with their associated functions. For a particular route, all enclosed functions accept `InType` and return `OutType`.
-
-### Paths
-
-A route can have additional path components added to it by using Swift 4.2 dynamic member lookup.
-
-```swift
-let route = root().hello { "Hello, world!" }
-```
-
-Now the route serves itself on `/hello`.
-
-```swift
-let route = root().hello.world { "Hello, world!" }
-```
-
-Now the route serves itself on `/hello/world`.
-
-Equivalently, you may use the `path` func to achieve the same thing.
-
-```swift
-let route = root().path("hello").path("world") { "Hello, world!" }
-```
-or
-
-```swift
-let route = root().path("hello/world") { "Hello, world!" }
-```
-
-This may be required in cases where your desired path component string conflicts with a built-in func (*\*list these somewhere simply*) or contains characters which are invalid for Swift identifiers. You may also simply prefer it stylistically, or may be using variable path names. These are all good reasons why one might want to use the `path` func over dynamic member lookup.
-
-All further examples in this document use dynamic member lookup.
-
-Note that paths which begin with a number, or consist wholly of numbers, are valid when using dynamic member lookup, even though they would normally not be when used as a property or func. This is a bit of a digression, but, for example:
-
-```swift
-let route = root().1234 { "This is cool" }.text()
-
-struct MyTotallyUnrelatedStruct {
-	func 1234() -> String { ... } // compilation error
+try await Server(routes: routes, port: 8080).withServer { boundPort in
+    // server is live; boundPort is the actually-bound port (useful when port: 0)
 }
+// server has shut down
 ```
 
-### Combining Routes
+---
 
-Most servers will want to service more than one URI. Routes can be combined in various ways. Combined routes behave as though they were one route. Combined routes can be bound and can listen for connections the same as an individual route can.
-
-Routes are combined using the `dir` func. Dir will append the given routes to the receiver and return a new route object containing all of the routes.
+## Package.swift
 
 ```swift
-let helloRoute = root().hello { "Hello, world!" }
-let byeRoute = root().bye { "Bye, world!" }
-
-let combinedRoutes = try root().v1.dir(helloRoute, byeRoute).text()
-
-try combinedRoutes.bind(port: 8080).listen().wait()
+dependencies: [
+    .package(url: "https://github.com/taplin/Perfect-NIO.git", branch: "swiftCoreUpdate"),
+],
+targets: [
+    .target(
+        name: "MyServer",
+        dependencies: [
+            .product(name: "PerfectNIO", package: "Perfect-NIO"),
+        ]
+    ),
+]
 ```
 
-The above creates two routes which can be accessed at the URIs `/v1/hello` and `/v1/bye`. These two routes are combined and then the `text()` func is applied to them so that they return a text/plain content type.
+Your code will typically `import PerfectNIO`. The library re-exports `NIO`, `NIOHTTP1`, and `NIOSSL`, so you usually do not need to import those separately.
 
-Dir will ensure that you are not adding any duplicate routes and will throw an Error if you are.
+Optional: add `PerfectNIOMustache` for Mustache template output.
 
-Dir can be called and passed either a variadic number of routes, an array of routes, or a closure which accepts a stand-in route and returns an array of routes to append. Let's look closer at this last case.
+---
+
+## Routing
+
+### root()
+
+Every route tree starts with `root()`. It creates a single route at `/` that passes the `HTTPRequest` through unchanged.
 
 ```swift
-let foos = try root().v1.dir{[
-	$0.foo1 { "OK1" },
-	$0.foo2 { "OK2" },
-	$0.foo3 { "OK3" },
+root()                          // Routes<HTTPRequest, HTTPRequest>
+root { "Hello" }               // Routes<HTTPRequest, String> — ignores the request
+root { req in req.path }       // Routes<HTTPRequest, String> — uses the request
+```
+
+### Path components
+
+Append path segments using Swift dynamic member lookup or the `path` function:
+
+```swift
+root().hello.world { "Hello, world!" }.text()   // serves /hello/world
+root().path("hello").path("world") { "Hello" }.text()
+root().path("hello/world") { "Hello" }.text()   // equivalent
+```
+
+Numeric path components are valid via dynamic member lookup even though Swift does not normally allow them as identifiers:
+
+```swift
+root().v1.path("2024").reports { loadReports() }.json()
+```
+
+### Combining routes
+
+Use `dir` to compose multiple routes into one. `dir` throws `RouteError.duplicatedRoutes` if any two routes resolve to the same URI.
+
+```swift
+let routes = try root().dir(
+    root().hello { "Hello" },
+    root().bye   { "Bye"   }
+).text()
+
+try await Server(routes: routes, port: 8080).run()
+// serves /hello and /bye
+```
+
+Closure form — the argument `$0` is a stand-in for the parent route:
+
+```swift
+let routes = try root().v1.dir {[
+    $0.foo1 { "OK1" },
+    $0.foo2 { "OK2" },
+    $0.foo3 { "OK3" },
+]}.text()
+// serves /v1/foo1, /v1/foo2, /v1/foo3
+```
+
+Because routes are strongly typed, all routes passed to `dir` must share the same `OutType`. Mismatches are caught at compile time.
+
+---
+
+## Route operations
+
+All route closures are `async throws`. Return a value to pass it to the next operation, or throw to abort the request.
+
+### map
+
+Transform the current output value into something new.
+
+```swift
+// Routes<HTTPRequest, [String]>
+let routes = try root().dir {[
+    $0.a { 1 }.map { "\($0)" },            // Int → String
+    $0.b { [1, 2, 3] }.map { "\($0)" },    // each Int → String
 ]}.text()
 ```
 
-This produces the following routes: `/v1/foo1`, `/v1/foo2`, and `/v1/foo3`, which each have the `text()` func applied to them.
+### ext
 
-It's important to note that because routes are strongly typed, all routes that are passed to `dir` must accept whatever type of value the preceeding function returns. Any misuse will be caught at compilation time.
-
-The following case passes the current request's `path` URI to two different routes which each modify the value in some way and then pass it down the line.
+Match a file extension in the URI. Useful for serving the same data in multiple formats.
 
 ```swift
-let route = try root { $0.path }.v1.dir {[
-	$0.upper { $0.uppercased() },
-	$0.lower { $0.lowercased() }
-]}.text()			
+struct Report: Codable, CustomStringConvertible {
+    let id: Int
+    var description: String { "Report \(id)" }
+}
+let base = root().reports { Report(id: 1) }
+let routes = try root().dir(
+    base.ext("json").json(),   // /reports.json
+    base.ext("txt").text()     // /reports.txt
+)
 ```
 
-The above produces the following routes: `/v1/upper` and `/v1/lower`.
+### wild
 
-### HTTP Method
-
-Unless otherwise indicated, a route will serve for any HTTP method (GET, POST, etc.). Calling one of the method properties on a route will force it to serve only with the method indicated. 
+Match a single path segment as a wildcard.
 
 ```swift
-let route = try root().dir {[
-	$0.GET.foo1 { "GET OK" },
-	$0.POST.foo2 { "POST OK" },
+// /*/suffix — captures the first segment
+root().wild { $1 }.suffix.text()
+
+// Named wildcard — value stored in req.uriVariables
+root().v1.wild(name: "id").info
+    .request { _, req in req.uriVariables["id"] ?? "" }
+    .text()
+```
+
+### trailing
+
+Match all remaining path segments.
+
+```swift
+// /files/** — captures everything after /files/
+root().files.trailing { $1 }.text()
+// /files/docs/2024/report.txt → "docs/2024/report.txt"
+```
+
+### request
+
+Re-expose the `HTTPRequest` to a handler that has already moved to a different value.
+
+```swift
+root().hello { "Hello" }.request { greeting, req in
+    "\(greeting) from \(req.path)"
+}.text()
+```
+
+### readBody
+
+Read the request body and branch on content type.
+
+```swift
+root().upload.POST.readBody { _, content in
+    switch content {
+    case .multiPartForm(let form): return "multipart: \(form.bodySpecs.count) parts"
+    case .urlForm(let q):          return "form: \(q["name"].first ?? "")"
+    case .other(let bytes):        return "raw: \(bytes.count) bytes"
+    case .none:                    return "empty"
+    }
+}.text()
+```
+
+### decode
+
+Read and decode the request body as a `Decodable` type.
+
+```swift
+struct CreateUser: Decodable { let name: String; let email: String }
+
+// Decoded value replaces the pipeline value
+root().POST.users.decode(CreateUser.self) { user in
+    "\(user.name) created"
+}.text()
+
+// Both the previous value and the decoded value are available
+root().POST.users
+    .decode(CreateUser.self) { prev, user in user }
+    .json()
+```
+
+### statusCheck
+
+Inspect the current value and return an HTTP status. Any non-2xx status aborts the request.
+
+```swift
+root().admin
+    .statusCheck { req in req.headers["X-Admin-Key"].first == "secret" ? .ok : .forbidden }
+    .map { "Welcome, admin" }
+    .text()
+```
+
+### unwrap
+
+Safely unwrap an `Optional` output. Aborts with 500 if the value is `nil`.
+
+```swift
+let routes = try root().dir(
+    root().found  { Optional("value") },
+    root().missing { Optional<String>.none }
+).unwrap { $0 }.text()
+// /found → "value", /missing → 500
+```
+
+### Auth pattern — statusCheck + unwrap
+
+The canonical auth gate pattern:
+
+```swift
+struct Session: Sendable {
+    let userId: String
+}
+
+func session(from req: any HTTPRequest) -> Session? {
+    guard let token = req.headers["Authorization"].first else { return nil }
+    return validateToken(token).map { Session(userId: $0) }
+}
+
+let protected = root(session(from:))
+    .statusCheck { $0 == nil ? .unauthorized : .ok }
+    .unwrap { $0 }
+
+// All routes chained from `protected` have access to a non-nil Session
+let routes = protected.request { session, _ in session.userId }.text()
+```
+
+---
+
+## HTTP methods
+
+Without a method constraint, a route answers any HTTP method. Constrain with a property:
+
+```swift
+let routes = try root().dir {[
+    $0.GET.users   { listUsers()   }.json(),
+    $0.POST.users  { createUser()  }.json(),
+    $0.DELETE.users { deleteUsers() }.text(),
 ]}.text()
 ```
 
-Above, two routes are added, both with a URI of `/`. However, one accepts only GET and the other only POST.
-
-If you wish a route to serve more than one HTTP method, the `method` func will facilitate this.
+Accept multiple methods with `method(_:)`:
 
 ```swift
-let route = root().method(.GET, .POST).foo { "GET or POST OK" }.text()
+root().method(.GET, .HEAD).ping { "pong" }.text()
 ```
 
-This will creat a route `/foo` which will answer to either GET or POST.
+---
 
-Applying a method like this to routes which have already had methods applied to them will remove the old method and apply the new.
+## Output types
 
-### Route Operations
+### text()
 
-A variety of operations can be applied to a route. These operations include:
-
-#### map
-Transform an output in some way producing a new output or a sequence of output values.
-
-Definitions:
+Returns the value's `description` with `Content-Type: text/plain`.
 
 ```swift
-public extension Routes {
-	/// Add a function mapping the input to the output.
-	func map<NewOut>(_ call: @escaping (OutType) throws -> NewOut) -> Routes<InType, NewOut>
-	/// Add a function mapping the input to the output.
-	func map<NewOut>(_ call: @escaping () throws -> NewOut) -> Routes<InType, NewOut>
-	/// Map the values of a Collection to a new Array.
-	func map<NewOut>(_ call: @escaping (OutType.Element) throws -> NewOut) -> Routes<InType, Array<NewOut>> where OutType: Collection 
-}
+root { 42 }.text()                       // "42"
+root { Date() }.text()                    // ISO date string
+root().hello { "Hello, world!" }.text()
 ```
 
-Example:
+### json()
+
+Encodes an `Encodable` value as JSON with `Content-Type: application/json`.
 
 ```swift
-let route = try root().dir {[
-	$0.a { 1 }.map { "\($0)" }.text(),
-	$0.b { [1,2,3] }.map { (i: Int) -> String in "\(i)" }.json()
-]}
+struct User: Codable { let id: Int; let name: String }
+root().user { User(id: 1, name: "Alice") }.json()
 ```
 
-#### ext
-Apply a file extension to the routes.
+### compressed()
 
-Definitions:
+Wraps any `HTTPOutput` with gzip/deflate compression. Content shorter than ~14 KB or with an image/video/audio content type is passed through uncompressed.
 
 ```swift
-public extension Routes {
-	/// Adds the indicated file extension to the route set.
-	func ext(_ ext: String) -> Routes
-	/// Adds the indicated file extension to the route set.
-	/// Optionally set the response's content type.
-	/// The given function accepts the input value and returns a new value.
-	func ext<NewOut>(_ ext: String,
-					  contentType: String? = nil,
-					  _ call: @escaping (OutType) throws -> NewOut) -> Routes<InType, NewOut>
-}
+root { BytesOutput(body: largeBytes) as HTTPOutput }.compressed()
 ```
 
-Example:
+### FileOutput
 
-The following returns a `Foo` object to the client and makes the object available as either `json` or `text` by adding an appropriate file extension to the route URI.
+Serves a local file.
 
 ```swift
-struct Foo: Codable, CustomStringConvertible {
-	var description: String {
-		return "foo-data \(id)/\(date)"
-	}
-	let id: UUID
-	let date: Date
-}
-let fooRoute = root().foo { Foo(id: UUID(), date: Date()) }
-let route = try root().dir(
-			fooRoute.ext("json").json(),
-			fooRoute.ext("txt").text())
+root().logo {
+    try FileOutput(localPath: "/var/www/logo.png") as HTTPOutput
+}.ext("png")
 ```
 
-This will produce the routes `/foo.json` and `/foo.txt`.
+### MustacheOutput
 
-#### wild
-Apply a wildcard path segment.
-
-Definitions:
+Renders a Mustache template (requires the `PerfectNIOMustache` target).
 
 ```swift
-public extension Routes {
-	/// Adds a wildcard path component to the route set.
-	/// The given function accepts the input value and the value for that wildcard path component, as given by the HTTP client,
-	/// and returns a new value.
-	func wild<NewOut>(_ call: @escaping (OutType, String) throws -> NewOut) -> Routes<InType, NewOut>
-	/// Adds a wildcard path component to the route set.
-	/// Gives the wildcard path component a variable name and the path component value is added as a request urlVariable.
-	func wild(name: String) -> Routes
-}
-```
-
-Example:
-
-```swift
-let route = root().wild { $1 }.foo.text()
-```
-
-Above, the route `/*/foo` is created. The "*" can be any string, which is then echoed back to the client.
-
-WIldcard path components can also be given a name. This will make the component available through the `HTTPRequest.uriVariables` property, or for use during Decodable `decode` operations.
-
-Example:
-
-```swift
-struct Req: Codable {
-	let id: UUID
-	let action: String
-}
-let route = root().v1
-	.wild(name: "id")
-	.wild(name: "action")
-	.decode(Req.self) { return "\($1.id) - \($1.action)" }
-	.text()
-```
-
-The above creates the route `/v1/*/*`. The "id" and "action" wildcards are saved and used during decoding of the `Req` object. The `Req` properties are then echoed back to the client.
-
-#### trailing
-Apply a trailing wildcard path segment
-
-Definitions:
-
-```swift
-public extension Routes {
-	/// Adds a trailing-wildcard to the route set.
-	/// The given function accepts the input value and the value for the remaining path components, as given by the HTTP client,
-	/// and returns a new value.
-	func trailing<NewOut>(_ call: @escaping (OutType, String) throws -> NewOut) -> Routes<InType, NewOut>
-}
-```
-
-Example:
-
-```swift
-let route = root().foo.trailing { $1 }.text()
-```
-
-The route `/foo/**` is created, with "**" matching any subsequent path components. The remaining path components String is available as the second argument (the first argument is still the current `HTTPRequest` object), and is then echoed back to the client. If a client accessed the URI `/foo/OK/OK`, the String "OK/OK" would be made available as the trailing wildcard value.
-
-#### request
-Access the HTTPRequest object. 
-
-While all routes start off by receiving the current HTTPRequest object, it can often be more convenient to begin passing other values down your route pipeline but then go back to the request object for some cause.
-
-Definitions:
-
-```swift
-public extension Routes {
-	/// Adds the current HTTPRequest as a parameter to the function.
-	func request<NewOut>(_ call: @escaping (OutType, HTTPRequest) throws -> NewOut) -> Routes<InType, NewOut> 
-}
-```
-
-Example:
-
-```swift
-let route = root().foo { "OK" }.request { $1.path }.text()
-```
-
-This route URI is `/foo`. It echos back the request path by first discarding the HTTPRequest but then grabbing it again using the `request` func. The request is always provided as the second argument.
-
-#### readBody
-Read the client body data and deliver it to the provided callback.
-
-Definitions:
-
-```swift
-public extension Routes {
-	func readBody<NewOut>(_ call: @escaping (OutType, HTTPRequestContentType) throws -> NewOut) -> Routes<InType, NewOut>
-}
-```
-
-Example:
-
-```swift
-let route = root().POST.readBody {
-	(req: HTTPRequest, content: HTTPRequestContentType) -> String in
-	switch content {
-	case .urlForm: return "url-encoded"
-	case .multiPartForm: return "multi-part"
-	case .other: return "other"
-	case .none:	return "none"
-	}
-}.text()
-```
-
-This example accepts a POST request at `/`. It reads the submitted body and returns a String describing what type the data was.
-
-#### statusCheck
-Assert some condition by returning either 'OK' (200..<300 status code) or failing.
-
-Definitions:
-
-```swift
-public extension Routes {
-	/// The caller can inspect the given input value and choose to return an HTTP error code.
-	/// If any code outside of 200..<300 is return the request is aborted.
-	func statusCheck(_ handler: @escaping (OutType) throws -> HTTPResponseStatus) -> Routes<InType, OutType>
-	/// The caller can choose to return an HTTP error code.
-	/// If any code outside of 200..<300 is return the request is aborted.
-	func statusCheck(_ handler: @escaping () throws -> HTTPResponseStatus) -> Routes<InType, OutType>
-}
-```
-
-Example:
-
-```swift
-let route = try root().dir {[
-	$0.a,
-	$0.b
-]}.statusCheck {
-	req in
-	guard req.path != "/b" else {
-		return .internalServerError
-	}
-	return .ok
-}.map { req in "OK" }.text()
-```
-
-This route will serve the URIs `/a` and `/b`. However, the request will be deliberately failed with `.internalServerError` if the `/b` URI is accessed. After the function given to `statusCheck` is called, the route continues with the previous value. You can see this in the call to `map` where its first parameter reverts back to the current request after the status check.
-
-#### decode
-Read and decode the client body as a Decodable object.
-
-Decode offers a few variants to fit different use cases.
-
-Definitions:
-
-```swift
-public extension Routes {
-	/// Read the client content body and then attempt to decode it as the indicated `Decodable` type.
-	/// Both the original input value and the newly decoded object are delivered to the provided function.
-	func decode<Type: Decodable, NewOut>(_ type: Type.Type,
-					     _ handler: @escaping (OutType, Type) throws -> NewOut) -> Routes<InType, NewOut>
-	/// Read the client content body and then attempt to decode it as the indicated `Decodable` type.
-	/// The newly decoded object is delivered to the provided function.
-	func decode<Type: Decodable, NewOut>(_ type: Type.Type,
-					     _ handler: @escaping (Type) throws -> NewOut) -> Routes<InType, NewOut>
-	/// Read the client content body and then attempt to decode it as the indicated `Decodable` type.
-	/// The newly decoded object becomes the route set's new output value.
-	func decode<Type: Decodable>(_ type: Type.Type) -> Routes<InType, Type>
-	/// Decode the request body into the desired type, or throw an error.
-	/// This function would be used after the content body has already been read.
-	func decode<A: Decodable>(_ type: A.Type, content: HTTPRequestContentType) throws -> A
-}
-```
-
-Example:
-
-```swift
-struct Foo: Codable {
-	let id: UUID
-	let date: Date
-}
-let route = try root().POST.dir{[
-	$0.1.decode(Foo.self),
-	$0.2.decode(Foo.self) { $1 },
-	$0.3.decode(Foo.self) { $0 },
-]}.json()
-```
-
-This example will serve the URIs `/1`, `/2`, and `/3`. It decodes the POST body in three different ways. #1 decodes the body and returns it as the new value (discarding the HTTPRequest). #2 decodes the body and calls the closure with the previous value, the HTTPRequest, and with the newly decoded Foo object. This case simply returns the Foo as the new value. #3 decodes the body and accepts it in a closure which accepts only one argument. This also is simply returned as the new value. Finally, regardless of which URI was hit, the value is converted to json and returns to the client.
-
-#### unwrap
-Unwrap an Optional value, or fail the request if the value is nil.
-
-Definitions:
-
-```swift
-public extension Routes {
-	/// If the output type is an `Optional`, this function permits it to be safely unwraped.
-	/// If it can not be unwrapped the request is terminated.
-	/// The provided function is called with the unwrapped value.
-	func unwrap<U, NewOut>(_ call: @escaping (U) throws -> NewOut) -> Routes<InType, NewOut> where OutType == Optional<U>
-}
-```
-
-Example:
-
-```swift
-let route = try root().dir {[
-	$0.a { nil },
-	$0.b { "OK" }
-]}.unwrap { $0 }.text()
-```
-
-The above creates `/a` and `/b`. `/a` returns a nil `String?` while `/b` returns "OK". Either route's value will go through the `unwrap` func. If the value is nil, the request will be failed with an `.internalServerError`. (KRJ: address this. needs to be more flexible wrt response status code.)
-
-#### async
-Execute a task asynchronously, out of the NIO event loop.
-
-When performing lengthy or blocking operations, such as external URL requests or database operations, it is vital that the operation be moved out of the NIO event loop. This `async` func lets you do just that. The activity moves into a new thread out of the NIO event loop within which you have free reign. When your activity has completed, signal the provided EventLoopPromise with your return value by calling either `success` or `fail`.
-
-Definitions:
-
-```swift
-public extension Routes {
-	/// Run the call asynchronously on a non-event loop thread.
-	/// Caller must succeed or fail the given promise to continue the request.
-	func async<NewOut>(_ call: @escaping (OutType, EventLoopPromise<NewOut>) -> ()) -> Routes<InType, NewOut>
-}
-```
-
-Example:
-
-```swift
-let route = root().async {
-	(req: HTTPRequest, p: EventLoopPromise<String>) in
-	sleep(1)
-	p.succeed(result: "OK")
-}.text()
-```
-
-The above spins off an asynchronous activity (in this case, sleeping for 1 second) and then signals that it is complete. The value that it submits to the promise, "OK", is sent to the client.
-
-It's important to note that subsequent activities for the route will occur on the NIO event loop.
-
-#### text
-Use a `CustomStringConvertible` as the output with a text/plain content type.
-
-Definitions:
-
-```swift
-public extension Routes where OutType: CustomStringConvertible {
-	func text() -> Routes<InType, HTTPOutput>
-}
-```
-
-Example:
-
-```swift
-let route = root { 1 }.text()
-```
-
-Above, the route `/` is created which serves the stringified number 1.
-
-#### json
-Use an `Encodable` as the output with the application/json content type.
-
-Definitions:
-
-```swift
-public extension Routes where OutType: Encodable {
-	func json() -> Routes<InType, HTTPOutput>
-}
-```
-
-Example:
-
-```swift
-struct Foo: Codable {
-	let id: UUID
-	let date: Date
-}
-let route = root().foo { Foo(id: UUID(), date: Date()) }.json()
-```
-
-This example create a route `/foo` which returns a Foo object. The Foo is converted to JSON and sent to the client.
-
-#### compressed
-
-Outgoing client content can be compressed using either gzip or deflate algorithms by calling the `compressed()` function on any route returning HTTPOutput.
-
-```swift
-/// Compresses eligible output
-public extension Routes where OutType: HTTPOutput {
-	func compressed() -> Routes<InType, HTTPOutput>
-}
-```
-
-Compressed content takes HTTPOutput and then selectively compresses and sends the content to the client. If the source HTTPOutput object specifies a response Content-Length and that content length is less than 14k, the response will not be compressed. If the source HTTPoutput specifies a content-type and that type begins with "image/", "video/", or "audio/", the response will not be compressed.
-
-Example:
-
-```swift
-class StreamOutput: HTTPOutput {
-	var counter = 0
-	override init() {
-		super.init()
-		kind = .stream
-	}
-	override func body(promise: EventLoopPromise<IOData?>, allocator: ByteBufferAllocator) {
-		if counter > 15 {
-			promise.succeed(result: nil)
-		} else {
-			let toSend = String(repeating: "\(counter % 10)", count: 1024)
-			counter += 1
-			let ary = Array(toSend.utf8)
-			var buf = allocator.buffer(capacity: ary.count)
-			buf.write(bytes: ary)
-			promise.succeed(result: .byteBuffer(buf))
-		}
-	}
-}
-let route = root() { return StreamOutput() as HTTPOutput }.compressed()
-```
-
-This example streams text content to the client. The usage of `.compressed()` at the end of the route will turn on content compression.
-
-### HTTPOutput
-
-Considering a complete set of routes as a function, it would look like:
-
-`(HTTPRequest) -> HTTPOutput`
-
-<a href="httpoutput">`HTTPOutput`</a> is a base class which can optionally set the HTTP response status, headers and body data. Several concrete HTTPOutput implementations are provided for you, but you can add your own custom output by sub-classing and returning your object.
-
-Built-in HTTPOutput types include `HTTPOutputError`, which can be thrown, JSONOutput, TextOutput, CompressedOutput, FileOutput, MustacheOutput, and BytesOutput.
-
-```swift
-/// The response output for the client
-open class HTTPOutput {
-	/// Indicates how the `body` func data, and possibly content-length, should be handled
-	var kind: HTTPOutputResponseHint
-	/// Optional HTTP head
-	open func head(request: HTTPRequestHead) -> HTTPHead?
-	/// Produce body data
-	/// Set nil on last chunk
-	/// Call promise.fail upon failure
-	open func body(promise: EventLoopPromise<IOData?>, allocator: ByteBufferAllocator)
-	/// Called when the request has completed either successfully or with a failure.
-	/// Sub-classes can override to take special actions or perform cleanup operations.
-	/// Inherited implimenation does nothing.
-	open func closed()
-}
-```
-
-#### FileOutput
-
-File content can be returned from a route by using the `FileOutput` type.
-
-```swift
-public class FileOutput: HTTPOutput {
-	public init(localPath: String) throws
-}
-```
-
-Example:
-
-```swift
-let route = root().test {
-	try FileOutput(localPath: "/tmp/test.txt") as HTTPOutput
-}.ext("txt")
-```
-
-This example serves the route /test.txt and returns the content of a local file. If the file does not exist or is not readable then an Error will be thrown.
-
-#### MustacheOutput
-
-Content from mustache templates can be returned from a route by using the `MustacheOutput` type. 
-
-```swift
-public class MustacheOutput: HTTPOutput {
-	public init(templatePath: String,
-		    inputs: [String:Any],
-		    contentType: String) throws 
-}
-```
-
-Example:
-
-```swift
-let route = root().test {
-	try MustacheOutput(templatePath: tmpFilePath,
-			   inputs: ["key1":"value1", "key2":"value2"],
-			   contentType: "text/html") as HTTPOutput
+import PerfectNIOMustache
+
+root().page {
+    try MustacheOutput(
+        templatePath: "/var/www/template.html",
+        inputs: ["title": "Home", "items": items],
+        contentType: "text/html"
+    ) as HTTPOutput
 }.ext("html")
 ```
 
-This example processes and serves a mustache template file as text/html.
+---
 
-### Caveats
+## Custom HTTPOutput
 
-make notes on:
-using diseparate types in `dir`
-ordering of `wild` and `decode` wrt path variables
-doing blocking activities in a non-async func
-
-*TBD:*
-
-* Logging - use the new sss logging stuff
-
-### Reference
-
-<a name="rooot"></a>
-#### root()
+Subclass `HTTPOutput` to produce body data in chunks. Return `nil` from `nextChunk` to signal end of body.
 
 ```swift
-/// Create a root route accepting/returning the HTTPRequest.
+class StreamOutput: HTTPOutput, @unchecked Sendable {
+    var page = 0
+
+    override func head(request: HTTPRequestInfo) -> HTTPHead? {
+        HTTPHead(headers: HTTPHeaders([("Content-Type", "text/plain")]))
+    }
+
+    override func nextChunk(allocator: ByteBufferAllocator) async throws -> ByteBuffer? {
+        guard page < 16 else { return nil }
+        let chunk = String(repeating: "\(page % 10)", count: 1024)
+        page += 1
+        var buf = allocator.buffer(capacity: chunk.utf8.count)
+        buf.writeString(chunk)
+        return buf
+    }
+}
+
+// Combine with .compressed() for streaming compression
+let route = root { StreamOutput() as HTTPOutput }.compressed()
+```
+
+`closed()` is called once the response is fully written (or on error). Override it to release resources.
+
+```swift
+class FileStreamOutput: HTTPOutput, @unchecked Sendable {
+    let handle: FileHandle
+    init(path: String) throws {
+        guard let h = FileHandle(forReadingAtPath: path) else {
+            throw ErrorOutput(status: .notFound)
+        }
+        handle = h
+    }
+    override func nextChunk(allocator: ByteBufferAllocator) async throws -> ByteBuffer? {
+        let data = handle.readData(ofLength: 65536)
+        guard !data.isEmpty else { return nil }
+        var buf = allocator.buffer(capacity: data.count)
+        buf.writeBytes(data)
+        return buf
+    }
+    override func closed() { handle.closeFile() }
+}
+```
+
+---
+
+## WebSocket
+
+Declare a WebSocket endpoint with `webSocket(protocol:options:_:)`. The callback runs through the normal route pipeline and returns a `WebSocketHandler` — a closure that drives the live connection.
+
+```swift
+let echoRoute = root().echo.webSocket(protocol: "echo") { _ -> WebSocketHandler in
+    return { ws in
+        while true {
+            do {
+                switch try await ws.readMessage() {
+                case .text(let s):   try await ws.writeMessage(.text(s))
+                case .binary(let b): try await ws.writeMessage(.binary(b))
+                case .close:         try await ws.writeMessage(.close); return
+                default:             break
+                }
+            } catch { return }
+        }
+    }
+}
+```
+
+A WebSocket handshake to a path that does not have a `webSocket()` route is served as ordinary HTTP (returning the route's natural status, typically 404) — per RFC 6455 §4.2.2.
+
+### WebSocketOption
+
+| Option | Effect |
+|---|---|
+| `.manualClose` | Handler must reply to `.close` frames itself; otherwise auto-close-echo is sent |
+| `.manualPing` | Handler must reply to `.ping` frames; otherwise auto-pong is sent |
+
+---
+
+## TLS / HTTPS
+
+Pass a `TLSConfiguration` to `Server`. The private key and certificate can be loaded from PEM files or from embedded bytes.
+
+```swift
+import NIOSSL
+
+let cert = try NIOSSLCertificate(file: "/etc/ssl/cert.pem", format: .pem)
+let key  = try NIOSSLPrivateKey(file: "/etc/ssl/key.pem",  format: .pem)
+let tls  = TLSConfiguration.makeServerConfiguration(
+    certificateChain: [.certificate(cert)],
+    privateKey: .privateKey(key)
+)
+
+try await Server(routes: routes, port: 443, tls: tls).run()
+```
+
+---
+
+## Reference
+
+### Server
+
+```swift
+public struct Server: Sendable {
+    public var routes: Routes<HTTPRequest, HTTPOutput>
+    public var host: String              // default "0.0.0.0"
+    public var port: Int
+    public var tls: TLSConfiguration?
+    public var idleTimeout: TimeAmount?  // default .seconds(60) — nil disables
+    public var reusePortCount: Int       // default 1; >1 enables SO_REUSEPORT
+
+    public init(routes:, host:, port:, tls:, idleTimeout:, reusePortCount:)
+
+    /// Serve until the surrounding Task is cancelled.
+    public func run() async throws
+
+    /// Bind, run body, then shut down (structured-concurrency lifecycle).
+    @discardableResult
+    public func withServer<R>(_ body: (_ boundPort: Int) async throws -> R) async throws -> R
+}
+```
+
+`idleTimeout` closes connections that have no inbound reads for the specified duration. It is a defense against idle keep-alive connections and basic slowloris. Note: it measures *reads*, so streaming endpoints that take longer than the timeout to produce their first byte should use a larger value or `nil`.
+
+### root()
+
+```swift
 public func root() -> Routes<HTTPRequest, HTTPRequest>
-/// Create a root route accepting the HTTPRequest and returning some new value.
-public func root<NewOut>(_ call: @escaping (HTTPRequest) throws -> NewOut) -> Routes<HTTPRequest, NewOut>
-/// Create a root route returning some new value.
-public func root<NewOut>(_ call: @escaping () throws -> NewOut) -> Routes<HTTPRequest, NewOut>
-/// Create a root route accepting and returning some new value.
-public func root<NewOut>(path: String = "/", _ type: NewOut.Type) -> Routes<NewOut, NewOut>
+public func root<T>(_ call: @Sendable @escaping (any HTTPRequest) async throws -> T) -> Routes<HTTPRequest, T>
+public func root<T>(_ call: @Sendable @escaping () async throws -> T) -> Routes<HTTPRequest, T>
+public func root<T>(path: String, _ type: T.Type) -> Routes<T, T>
 ```
 
-<a name="routes"></a>
-#### Routes\<InType, OutType\>
+### Routes\<InType, OutType\>
 
 ```swift
-/// Main routes object.
-/// Created by calling `root()` or by chaining a function from an existing route.
-public struct Routes<InType, OutType> {
-	// Routes can not be directly instantiated.
-	// All functionality is provided through extensions.
+@dynamicMemberLookup
+public struct Routes<InType, OutType>: Sendable {
+    // Instantiated only via root() or by chaining operations.
 }
 ```
 
-<a name="httprequest"></a>
-#### HTTPRequest
+### HTTPRequest
 
 ```swift
-public protocol HTTPRequest {
-	var method: HTTPMethod { get }
-	var uri: String { get }
-	var headers: HTTPHeaders { get }
-	var uriVariables: [String:String] { get set }
-	var path: String { get }
-	var searchArgs: QueryDecoder? { get }
-	var contentType: String? { get }
-	var contentLength: Int { get }
-	var contentRead: Int { get }
-	var contentConsumed: Int { get }
-	var localAddress: SocketAddress? { get }
-	var remoteAddress: SocketAddress? { get }
-	/// Returns all the cookie name/value pairs parsed from the request.
-	var cookies: [String:String]
-	func readSomeContent() -> EventLoopFuture<[ByteBuffer]>
-	func readContent() -> EventLoopFuture<HTTPRequestContentType>
+public protocol HTTPRequest: AnyObject {
+    var method: HTTPMethod { get }
+    var uri: String { get }
+    var headers: HTTPHeaders { get }
+    var uriVariables: [String: String] { get set }
+    var path: String { get }
+    var searchArgs: QueryDecoder? { get }
+    var contentType: String? { get }
+    var contentLength: Int { get }
+    var contentRead: Int { get }
+    var contentConsumed: Int { get }
+    var localAddress: SocketAddress? { get }
+    var remoteAddress: SocketAddress? { get }
+    var cookies: [String: String] { get }          // extension — parsed from Cookie header
+    func readSomeContent() async throws -> [ByteBuffer]
+    func readContent() async throws -> HTTPRequestContentType
 }
 ```
 
-<a name="querydecoder"></a>
-#### QueryDecoder
+### HTTPOutput
+
+```swift
+open class HTTPOutput: @unchecked Sendable {
+    public init()
+    open func head(request: HTTPRequestInfo) -> HTTPHead?
+    open func nextChunk(allocator: ByteBufferAllocator) async throws -> ByteBuffer?
+    open func closed()
+}
+```
+
+### HTTPRequestContentType
+
+```swift
+public enum HTTPRequestContentType {
+    case none
+    case multiPartForm(MimeReader)
+    case urlForm(QueryDecoder)
+    case other([UInt8])
+}
+```
+
+### QueryDecoder
 
 ```swift
 public struct QueryDecoder {
-	public init(_ c: [UInt8])
-	public subscript(_ key: String) -> [String]
-	public func map<T>(_ call: ((String,String)) throws -> T) rethrows -> [T]
-	public func mapBytes<T>(_ call: ((String,ArraySlice<UInt8>)) throws -> T) rethrows -> [T]
-	public func get(_ key: String) -> [ArraySlice<UInt8>]
+    public init(_ c: [UInt8])
+    public subscript(_ key: String) -> [String]   // ["value"] or [] if absent
+    public func map<T>(_ call: ((String, String)) throws -> T) rethrows -> [T]
+    public func get(_ key: String) -> [ArraySlice<UInt8>]
 }
 ```
 
-<a name="dir"></a>
-#### dir
+Usage:
 
 ```swift
-/// These extensions append new route sets to an existing set.
-public extension Routes {
-	/// Append new routes to the set given a new output type and a function which receives a route object and returns an array of new routes.
-	/// This permits a sort of shorthand for adding new routes.
-	/// At times, Swift's type inference can fail to discern what the programmer intends when calling functions like this.
-	/// Calling the second version of this method, the one accepting a `type: NewOut.Type` as the first parameter,
-	/// can often clarify your intentions to the compiler. If you experience a compilation error with this function, try the other.
-	func dir<NewOut>(_ call: (Routes<OutType, OutType>) throws -> [Routes<OutType, NewOut>]) throws -> Routes<InType, NewOut>
-	/// Append new routes to the set given a new output type and a function which receives a route object and returns an array of new routes.
-	/// This permits a sort of shorthand for adding new routes.
-	/// The first `type` argument to this function serves to help type inference.
-	func dir<NewOut>(type: NewOut.Type, _ call: (Routes<OutType, OutType>) -> [Routes<OutType, NewOut>]) throws -> Routes<InType, NewOut>
-	/// Append new routes to this set given an array.
-	func dir<NewOut>(_ registries: [Routes<OutType, NewOut>]) throws -> Routes<InType, NewOut>
-	/// Append a new route set to this set.
-	func dir<NewOut>(_ registry: Routes<OutType, NewOut>, _ registries: Routes<OutType, NewOut>...) throws -> Routes<InType, NewOut>
+// From a URL query string
+if let args = request.searchArgs {
+    let ids = args["id"]   // [String]
 }
+
+// From a URL-encoded POST body
+root().POST.readBody { _, content in
+    guard case .urlForm(let q) = content else { return "bad" }
+    return q["name"].first ?? ""
+}.text()
 ```
 
-<a name="routeerror"></a>
-#### RouteError
+### RouteError
 
 ```swift
-/// An error occurring during process of building a set of routes.
-public enum RouteError: Error, CustomStringConvertible {
-	case duplicatedRoutes([String])
-	public var description: String
+public enum RouteError: Error {
+    case duplicatedRoutes([String])
 }
 ```
 
-<a name="httpoutput"></a>
-#### HTTPOutput
-
-```swift
-/// The response output for the client
-open class HTTPOutput {
-	/// Indicates how the `body` func data, and possibly content-length, should be handled
-	var kind: HTTPOutputResponseKind
-	/// Optional HTTP head
-	open func head(request: HTTPRequestHead) -> HTTPHead?
-	/// Produce body data
-	/// Set nil on last chunk
-	/// Call promise.fail upon failure
-	open func body(promise: EventLoopPromise<IOData?>, allocator: ByteBufferAllocator)
-	/// Called when the request has completed either successfully or with a failure.
-	/// Sub-classes can override to take special actions or perform cleanup operations.
-	/// Inherited implimenation does nothing.
-	open func closed()
-}
-```
-
-<a name="httprequestcontenttype"></a>
-#### HTTPRequestContentType
-
-```swift
-/// Client content which has been read and parsed (if needed).
-public enum HTTPRequestContentType {
-	/// There was no content provided by the client.
-	case none
-	/// A multi-part form/file upload.
-	case multiPartForm(MimeReader)
-	/// A url-encoded form.
-	case urlForm(QueryDecoder)
-	/// Some other sort of content.
-	case other([UInt8])
-}
-```
-
-<a name="listeningroutes"></a>
-#### ListeningRoutes
-
-```swift
-/// Routes which have been bound to a port and have started listening for connections.
-public protocol ListeningRoutes {
-	/// Stop listening for requests
-	@discardableResult
-	func stop() -> ListeningRoutes
-	/// Wait, perhaps forever, until the routes have stopped listening for requests.
-	func wait() throws
-}
-```
-
-<a name="boundroutes"></a>
-#### BoundRoutes
-
-```swift
-/// Routes which have been bound to an address but are not yet listening for requests.
-public protocol BoundRoutes {
-	/// The address the server is bound to.
-	var address: SocketAddress { get }
-	/// Start listening
-	func listen() throws -> ListeningRoutes
-}
-```
-
-<a name="methods"></a>
-#### HTTP Methods
+### HTTP methods
 
 ```swift
 public extension Routes {
-	var GET: Routes<InType, OutType>
-	var POST: Routes
-	var PUT: Routes
-	var DELETE: Routes
-	var OPTIONS: Routes
-	func method(_ method: HTTPMethod, _ methods: HTTPMethod...) -> Routes
+    var GET: Routes { method(.GET) }
+    var POST: Routes { method(.POST) }
+    var PUT: Routes { method(.PUT) }
+    var DELETE: Routes { method(.DELETE) }
+    var OPTIONS: Routes { method(.OPTIONS) }
+    func method(_ method: HTTPMethod, _ rest: HTTPMethod...) -> Routes
 }
 ```
 
-<a name="usage"></a>
-### Package.swift Usage
-
-In your Package.swift:
+### WebSocket
 
 ```swift
-.package(url: "https://github.com/PerfectlySoft/Perfect-NIO.git", .branch("master"))
+public enum WebSocketMessage: Sendable {
+    case close
+    case ping, pong
+    case text(String), binary([UInt8])
+}
+
+public enum WebSocketOption: Sendable {
+    case manualClose
+    case manualPing
+}
+
+public protocol WebSocket: Sendable {
+    var options: [WebSocketOption] { get }
+    func readMessage() async throws -> WebSocketMessage
+    func writeMessage(_ message: WebSocketMessage) async throws
+}
+
+public typealias WebSocketHandler = @Sendable (WebSocket) async -> Void
+
+public extension Routes {
+    func webSocket(protocol: String,
+                   options: [WebSocketOption] = [],
+                   _ callback: @Sendable @escaping (OutType) async throws -> WebSocketHandler)
+        -> Routes<InType, HTTPOutput>
+}
 ```
 
-Your code may need to `import PerfectNIO`, `import NIO`, `import NIOHTTP1`, or `import NIOSSL`.
+### routes.describe
+
+Enumerate all registered route URIs (available on `Routes<HTTPRequest, HTTPOutput>`):
+
+```swift
+for desc in routes.describe {
+    print(desc.uri)   // e.g. "/v1/users", "GET:///v1/users"
+}
+```
+
+---
+
+## Linux support
+
+The PerfectNIO library is expected to compile and run on Linux — SwiftNIO is fully cross-platform, and the `CZlib` system library target includes an `apt` provider (`zlib1g-dev`).
+
+The `platforms: [.macOS(.v15)]` entry in `Package.swift` specifies the minimum macOS deployment target only. Linux support is always implicit in SwiftPM and is not restricted by that entry.
+
+> **Research needed:** Linux support has not been CI-verified as part of this resurrection. `URLSessionWebSocketTask` availability in `swift-corelibs-foundation` on Linux needs confirmation before the test suite can be declared Linux-clean. The `LinuxMain.swift` file was intentionally removed — Swift 5.4+ auto-discovers tests on Linux via `swift test` without it.
+
+To build and test on Linux:
+
+```bash
+# Install system dependencies (Ubuntu/Debian)
+apt-get install libssl-dev zlib1g-dev
+
+swift build
+swift test
+```
