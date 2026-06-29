@@ -1,5 +1,13 @@
 import Foundation
+#if canImport(Darwin)
 import Darwin
+private func posixWrite(_ fd: Int32, _ buf: UnsafeRawPointer!, _ n: Int) -> Int { Darwin.write(fd, buf, n) }
+private func posixClose(_ fd: Int32) { _ = Darwin.close(fd) }
+#else
+import Glibc
+private func posixWrite(_ fd: Int32, _ buf: UnsafeRawPointer!, _ n: Int) -> Int { Glibc.write(fd, buf, n) }
+private func posixClose(_ fd: Int32) { _ = Glibc.close(fd) }
+#endif
 
 public final class TempUploadFile {
     public let path: String
@@ -23,7 +31,7 @@ public final class TempUploadFile {
     public func write(bytes: [UInt8], dataPosition: Int, length: Int) throws -> Int {
         guard fd >= 0 else { throw POSIXError(.EBADF) }
         let written = bytes.withUnsafeBytes { ptr in
-            Darwin.write(fd, ptr.baseAddress!.advanced(by: dataPosition), length)
+            posixWrite(fd, ptr.baseAddress!.advanced(by: dataPosition), length)
         }
         guard written >= 0 else { throw POSIXError(.EIO) }
         return written
@@ -31,7 +39,7 @@ public final class TempUploadFile {
 
     public func close() {
         guard fd >= 0 else { return }
-        Darwin.close(fd)
+        posixClose(fd)
         fd = -1
     }
 

@@ -18,7 +18,11 @@
 //
 
 import Foundation
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Logging
 
 private let logger = Logger(label: "perfect.nio.mimereader")
