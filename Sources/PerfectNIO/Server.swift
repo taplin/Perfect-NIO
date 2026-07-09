@@ -60,6 +60,10 @@ public struct Server: Sendable {
 	public var port: Int
 	/// TLS configuration. When non-nil the server speaks HTTPS.
 	public var tls: TLSConfiguration?
+	/// Live-updatable per-domain TLS manager. Enables multi-tenant SNI: dozens of domains,
+	/// each with its own cert, hot-swappable without restarting the server. When both `tls`
+	/// and `tlsManager` are set, `tlsManager` takes precedence.
+	public var tlsManager: TLSContextManager?
 	/// Closes a connection after this much time with no inbound read. `nil` disables the timeout.
 	///
 	/// This bounds idle keep-alive connections (resource-exhaustion / basic slowloris defense).
@@ -126,14 +130,21 @@ public struct Server: Sendable {
 	private func serve(onReady: (_ boundPort: Int) async throws -> Void) async throws {
 		_ = processGlobalInit
 		let finder = try RouteFinderDual(routes)
-		let isTLS = tls != nil
-		let sslContext = try tls.map { try NIOSSLContext(configuration: $0) }
+		let resolvedManager: TLSContextManager?
+		if let manager = tlsManager {
+			resolvedManager = manager
+		} else if let config = tls {
+			resolvedManager = try TLSContextManager(default: config)
+		} else {
+			resolvedManager = nil
+		}
+		let isTLS = resolvedManager != nil
 		let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
 
 		func shutdown() async { try? await group.shutdownGracefully() }
 
 		do {
-			let channels = try await bind(group: group, sslContext: sslContext, finder: finder, isTLS: isTLS)
+			let channels = try await bind(group: group, tlsManager: resolvedManager, finder: finder, isTLS: isTLS)
 			let boundPort = channels.first?.channel.localAddress?.port ?? port
 			try await withThrowingTaskGroup(of: Void.self) { acceptors in
 				for channel in channels {
@@ -161,7 +172,7 @@ public struct Server: Sendable {
 	/// Binds `reusePortCount` server channels on the configured host/port. Each child channel is
 	/// configured with an HTTP pipeline that can upgrade to WebSocket (see `configureUpgrade`).
 	private func bind(group: MultiThreadedEventLoopGroup,
-	                  sslContext: NIOSSLContext?,
+	                  tlsManager: TLSContextManager?,
 	                  finder: any RouteFinder,
 	                  isTLS: Bool) async throws -> [HTTPServerChannel] {
 		let count = max(1, reusePortCount)
@@ -185,8 +196,8 @@ public struct Server: Sendable {
 				.childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
 			let channel = try await bootstrap.bind(host: host, port: port) { childChannel in
 				childChannel.eventLoop.makeCompletedFuture {
-					if let sslContext = sslContext {
-						try childChannel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: sslContext))
+					if let manager = tlsManager {
+						try childChannel.pipeline.syncOperations.addHandler(SNIPeekHandler(manager: manager))
 					}
 					return try Server.configureUpgrade(channel: childChannel, finder: finder, isTLS: isTLS, idleTimeout: idle)
 				}
@@ -321,6 +332,38 @@ public struct Server: Sendable {
 		} catch {
 			// Upgrade negotiation failed or the connection errored before producing a result.
 		}
+	}
+}
+
+// MARK: - HTTP→HTTPS redirect
+
+extension Server {
+	/// Creates a redirect-only server on `port` (default 80).
+	///
+	/// Every inbound HTTP request — regardless of path, method, or body — receives a
+	/// permanent redirect to the equivalent `https://` URL. The default 308 status
+	/// preserves the HTTP method (POST stays POST). Pass `.movedPermanently` (301) only
+	/// when legacy clients that pre-date RFC 7538 must be supported.
+	///
+	/// Usage:
+	/// ```swift
+	/// async let _ = Server.httpRedirect().run()
+	/// async let _ = Server(routes: appRoutes, port: 443, tlsManager: certManager).run()
+	/// try await withThrowingTaskGroup(of: Void.self) { group in
+	///     group.addTask { try await Server.httpRedirect().run() }
+	///     group.addTask { try await httpsServer.run() }
+	///     try await group.waitForAll()
+	/// }
+	/// ```
+	public static func httpRedirect(
+		port: Int = 80,
+		status: HTTPResponseStatus = .permanentRedirect
+	) -> Server {
+		let routes = root().trailing { (req: any HTTPRequest, _: String) -> HTTPOutput in
+			let host = req.headers.first(name: "host") ?? ""
+			return RedirectOutput(to: "https://\(host)\(req.uri)", status: status)
+		}
+		return Server(routes: routes, port: port)
 	}
 }
 
