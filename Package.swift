@@ -9,14 +9,12 @@ let package = Package(
     products: [
         .executable(name: "PerfectNIOExe", targets: ["PerfectNIOExe"]),
         .library(name: "PerfectNIO", targets: ["PerfectNIO"]),
-        .library(name: "PerfectNIOMustache", targets: ["PerfectNIOMustache"]),
         .library(name: "PerfectNIOCRUD", targets: ["PerfectNIOCRUD"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.0"),
         .package(url: "https://github.com/apple/swift-nio-extras.git", from: "1.21.0"),
-        .package(url: "https://github.com/PerfectlySoft/Perfect-Mustache.git", from: "4.0.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
         .package(path: "../Perfect-CRUD"),
         .package(path: "../Perfect-MySQL"),
@@ -47,16 +45,6 @@ let package = Package(
                 .product(name: "NIOExtras", package: "swift-nio-extras"),
                 .product(name: "Logging", package: "swift-log"),
                 "CZlib",
-            ]
-        ),
-        // Optional: Mustache template support
-        .target(
-            name: "PerfectNIOMustache",
-            dependencies: [
-                "PerfectNIO",
-                .product(name: "PerfectMustache", package: "Perfect-Mustache"),
-                .product(name: "NIO", package: "swift-nio"),
-                .product(name: "NIOHTTP1", package: "swift-nio"),
             ]
         ),
         .target(
