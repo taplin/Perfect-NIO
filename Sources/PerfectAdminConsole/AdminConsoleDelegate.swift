@@ -56,6 +56,19 @@ public protocol AdminConsoleDelegate: AnyObject, Sendable {
     /// Return an empty array (default) to suppress the actions panel.
     func availableActions() async -> [AdminAction]
 
+    // MARK: Phase 3 — datasource management
+
+    /// All datasource connections to surface in the admin console.
+    /// Return only sanitized info: alias + schema name, **never** credentials.
+    func registeredDatasources() async -> [DatasourceInfo]
+
+    /// Test a specific named datasource connection on demand.
+    ///
+    /// Only called for `name` values returned by `registeredDatasources()`.
+    /// Return `.failed("reason")` rather than throwing — that produces a clean
+    /// toast notification rather than a 500 error in the UI.
+    func testDatasource(name: String) async throws -> DatasourceTestResult
+
     /// Execute a custom action by name. Only called for names returned by `availableActions()`.
     /// Return `.failed` rather than throwing to send a friendly error message to the UI.
     func executeAction(_ name: String) async throws -> AdminActionResult
@@ -76,4 +89,8 @@ public extension AdminConsoleDelegate {
         .failed("Unknown action: \(name)")
     }
     func reloadTLSCertificates() async throws {}
+    func registeredDatasources() async -> [DatasourceInfo] { [] }
+    func testDatasource(name: String) async throws -> DatasourceTestResult {
+        .failed("No datasource named '\(name)' is registered")
+    }
 }

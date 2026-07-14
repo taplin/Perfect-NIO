@@ -463,3 +463,132 @@ final class BuiltinActionsTests: XCTestCase {
         XCTAssertEqual(actions.map(\.name), ["clear-logs", "reload-tls"])
     }
 }
+
+// MARK: - Phase 3: DatasourceInfo
+
+final class DatasourceInfoTests: XCTestCase {
+
+    func testInit_storesAllFields() {
+        let ds = DatasourceInfo(name: "mysql-main", alias: "MainDB", schema: "appdb", driver: "MySQL")
+        XCTAssertEqual(ds.name, "mysql-main")
+        XCTAssertEqual(ds.alias, "MainDB")
+        XCTAssertEqual(ds.schema, "appdb")
+        XCTAssertEqual(ds.driver, "MySQL")
+    }
+
+    func testInit_emptyStringsAllowed() {
+        let ds = DatasourceInfo(name: "", alias: "", schema: "", driver: "")
+        XCTAssertEqual(ds.name, "")
+    }
+
+    func testSendable_usableAcrossActors() async {
+        let ds = DatasourceInfo(name: "pg", alias: "Postgres", schema: "public", driver: "PostgreSQL")
+        let name = await Task.detached { ds.name }.value
+        XCTAssertEqual(name, "pg")
+    }
+}
+
+// MARK: - Phase 3: DatasourceTestResult
+
+final class DatasourceTestResultTests: XCTestCase {
+
+    func testOk_defaultMessage() {
+        let r = DatasourceTestResult.ok()
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.message, "Connection OK")
+        XCTAssertNil(r.latencyMs)
+    }
+
+    func testOk_withLatency() {
+        let r = DatasourceTestResult.ok(latencyMs: 3.7)
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.latencyMs, 3.7)
+    }
+
+    func testOk_withCustomMessage() {
+        let r = DatasourceTestResult.ok(message: "MySQL 9.6 · 2ms")
+        XCTAssertEqual(r.message, "MySQL 9.6 · 2ms")
+    }
+
+    func testFailed_successIsFalse() {
+        let r = DatasourceTestResult.failed("Connection refused")
+        XCTAssertFalse(r.success)
+        XCTAssertEqual(r.message, "Connection refused")
+    }
+
+    func testFailed_latencyIsNil() {
+        let r = DatasourceTestResult.failed("Timeout")
+        XCTAssertNil(r.latencyMs)
+    }
+
+    func testDirectInit_allFields() {
+        let r = DatasourceTestResult(success: true, message: "OK", latencyMs: 12.5)
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.message, "OK")
+        XCTAssertEqual(r.latencyMs, 12.5)
+    }
+
+    func testDirectInit_latencyDefaultsToNil() {
+        let r = DatasourceTestResult(success: false, message: "err")
+        XCTAssertNil(r.latencyMs)
+    }
+}
+
+// MARK: - Phase 3: AdminConsoleDelegate defaults
+
+private final class MinimalDelegate3: AdminConsoleDelegate {}
+
+final class AdminConsoleDelegatePhase3Tests: XCTestCase {
+
+    func testDefaultRegisteredDatasources_isEmpty() async {
+        let d = MinimalDelegate3()
+        let sources = await d.registeredDatasources()
+        XCTAssertTrue(sources.isEmpty)
+    }
+
+    func testDefaultTestDatasource_returnsFailed() async throws {
+        let d = MinimalDelegate3()
+        let result = try await d.testDatasource(name: "any-ds")
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.message.contains("any-ds"))
+    }
+
+    func testDefaultTestDatasource_latencyIsNil() async throws {
+        let d = MinimalDelegate3()
+        let result = try await d.testDatasource(name: "x")
+        XCTAssertNil(result.latencyMs)
+    }
+}
+
+// MARK: - Phase 3: AdminWebUI datasource section
+
+final class AdminWebUIDatasourceTests: XCTestCase {
+
+    func testResponse_containsDatasourceCard() async throws {
+        let output = AdminWebUI.response(tokenFilePath: "/tmp/tok.token")
+        var body: [UInt8] = []
+        let alloc = ByteBufferAllocator()
+        var chunk = try await output.nextChunk(allocator: alloc)
+        while let buf = chunk {
+            body.append(contentsOf: buf.readableBytesView)
+            chunk = try await output.nextChunk(allocator: alloc)
+        }
+        let html = String(decoding: body, as: UTF8.self)
+        XCTAssertTrue(html.contains("datasource-content"), "Datasource card container missing")
+        XCTAssertTrue(html.contains("Datasources"), "Datasource card heading missing")
+    }
+
+    func testResponse_containsDatasourceTestFunction() async throws {
+        let output = AdminWebUI.response(tokenFilePath: "/tmp/tok.token")
+        var body: [UInt8] = []
+        let alloc = ByteBufferAllocator()
+        var chunk = try await output.nextChunk(allocator: alloc)
+        while let buf = chunk {
+            body.append(contentsOf: buf.readableBytesView)
+            chunk = try await output.nextChunk(allocator: alloc)
+        }
+        let html = String(decoding: body, as: UTF8.self)
+        XCTAssertTrue(html.contains("testDS"), "testDS JS function missing")
+        XCTAssertTrue(html.contains("/api/datasources/test"), "datasource test endpoint missing from JS")
+    }
+}

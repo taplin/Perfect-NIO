@@ -92,6 +92,9 @@ main{padding:20px;max-width:980px;margin:0 auto}
 .log-footer{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:8px}
 /* ---- delegate sections ---- */
 #delegate-cards{margin-top:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+/* ---- mini buttons (datasource test, tls ops) ---- */
+.mini-btn{padding:3px 9px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);cursor:pointer;font-size:11px;font-weight:600;white-space:nowrap}
+.mini-btn:hover{background:var(--accent);color:#fff}
 /* ---- actions section ---- */
 #actions-section{margin-top:14px}
 .action-btn{padding:5px 12px;border:1px solid var(--accent);border-radius:6px;background:transparent;color:var(--accent);cursor:pointer;font-size:12px;font-weight:600;transition:background .15s,color .15s}
@@ -129,6 +132,7 @@ main{padding:20px;max-width:980px;margin:0 auto}
       <div class="card"><h2>TLS Domains</h2><div id="tls-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
       <div class="card"><h2>ACME Challenges</h2><div id="acme-rows"><div class="row"><span class="rl">Loading…</span></div></div></div>
       <div class="card"><h2>Routes</h2><div id="routes-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
+      <div class="card" id="datasource-card"><h2>Datasources</h2><div id="datasource-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
     </div>
     <div class="card" id="log-card">
       <h2>Log Tail <span id="log-meta" style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)"></span></h2>
@@ -179,15 +183,16 @@ async function api(path) {
 
 async function refresh() {
   try {
-    const [status, tls, acme, logs, routes] = await Promise.all([
+    const [status, tls, acme, logs, routes, datasources] = await Promise.all([
       api('/api/status'), api('/api/tls'), api('/api/acme'),
-      api('/api/logs?count=100'), api('/api/routes'),
+      api('/api/logs?count=100'), api('/api/routes'), api('/api/datasources'),
     ]);
     renderStatus(status);
     renderTLS(tls);
     renderACME(acme);
     renderLogs(logs);
     renderRoutes(routes);
+    renderDatasources(datasources);
     if (status.additionalSections && status.additionalSections.length)
       renderDelegate(status.additionalSections);
     document.getElementById('refresh-badge').textContent =
@@ -244,6 +249,40 @@ function renderRoutes(r) {
   }
   document.getElementById('routes-content').innerHTML =
     r.routes.map(u => '<span class="tag">' + esc(u) + '</span>').join('');
+}
+
+// ---- Phase 3: datasources ----
+
+function renderDatasources(d) {
+  const el = document.getElementById('datasource-content');
+  if (!d.datasources || !d.datasources.length) {
+    el.innerHTML = '<div class="row"><span class="rl" style="color:var(--muted)">No datasources registered</span></div>';
+    return;
+  }
+  el.innerHTML = d.datasources.map(ds => {
+    const safeName = esc(ds.name).replace(/'/g, "\\'");
+    return '<div class="row">' +
+      '<span class="rl">' + esc(ds.alias || ds.name) +
+      '<br><small style="color:var(--muted)">' + esc(ds.driver) + ' · ' + esc(ds.schema) + '</small></span>' +
+      '<button class="mini-btn" onclick="testDS(\'' + safeName + '\')">Test</button>' +
+      '</div>';
+  }).join('');
+}
+
+async function testDS(name) {
+  try {
+    const r = await fetch('/api/datasources/test', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'X-Admin-CSRF': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    if (r.status === 401) { logout(); return; }
+    const data = await r.json();
+    const latency = data.latencyMs != null ? ' (' + Math.round(data.latencyMs) + 'ms)' : '';
+    showToast(name + ': ' + data.message + latency, data.success ? 'ok' : 'err');
+  } catch(e) {
+    showToast('Test failed: ' + e.message, 'err');
+  }
 }
 
 function renderDelegate(sections) {

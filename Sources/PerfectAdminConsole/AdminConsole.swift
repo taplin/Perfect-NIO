@@ -177,6 +177,37 @@ public actor AdminConsole {
             return try JSONOutput(RoutesEnc(routes: uris))
         }
 
+        // ── Phase 3: datasource management ───────────────────────────────────
+
+        // GET /api/datasources — list all registered datasources (sanitized, no credentials)
+        let datasourcesRoute = root().GET.path("api").path("datasources").map { (req: any HTTPRequest) async throws -> HTTPOutput in
+            try tokenStore.requireAuth(from: req.headers)
+            let sources = await delegate?.registeredDatasources() ?? []
+            struct DSEnc: Encodable { let name, alias, schema, driver: String }
+            struct DSListEnc: Encodable { let datasources: [DSEnc] }
+            return try JSONOutput(DSListEnc(datasources: sources.map {
+                DSEnc(name: $0.name, alias: $0.alias, schema: $0.schema, driver: $0.driver)
+            }))
+        }
+
+        // POST /api/datasources/test — ping a named datasource on demand
+        let datasourceTestRoute = root().POST.path("api").path("datasources").path("test").map { (req: any HTTPRequest) async throws -> HTTPOutput in
+            try tokenStore.requireAuth(from: req.headers)
+            try requireCSRF(headers: req.headers, port: adminPort)
+            let bytes = try await adminReadJSONBody(req)
+            struct Body: Decodable { let name: String }
+            let body = try JSONDecoder().decode(Body.self, from: Data(bytes))
+            let result: DatasourceTestResult
+            if let del = delegate {
+                result = (try? await del.testDatasource(name: body.name)) ?? .failed("Test threw an unexpected error")
+            } else {
+                result = .failed("No delegate configured")
+            }
+            await logCapture?.capture("[admin] datasource-test name=\(body.name) success=\(result.success): \(result.message)")
+            struct ResultEnc: Encodable { let success: Bool; let message: String; let latencyMs: Double? }
+            return try JSONOutput(ResultEnc(success: result.success, message: result.message, latencyMs: result.latencyMs))
+        }
+
         // ── Phase 2: mutating routes ──────────────────────────────────────────
 
         // GET /api/actions — list built-in + delegate actions
@@ -240,6 +271,7 @@ public actor AdminConsole {
         }
 
         return try root().dir(uiRoute, statusRoute, tlsRoute, acmeRoute, logsRoute, routesRoute,
+                              datasourcesRoute, datasourceTestRoute,
                               actionsGetRoute, actionsPostRoute, clearLogsRoute)
     }
 }
