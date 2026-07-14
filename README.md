@@ -580,6 +580,33 @@ curl -s -X DELETE \
   http://127.0.0.1:8990/api/tls/domain | jq
 ```
 
+### Phase 5 — live datasource config switching
+
+The config switcher lets operators change a datasource's active configuration at runtime without restarting the server. It is intentionally framework-agnostic: the `id` field in `DatasourceConfigInfo` is an opaque string your delegate maps to whatever switching mechanism you use.
+
+| Endpoint | Body | Effect |
+|---|---|---|
+| `GET /api/datasources` | — | Returns each datasource including its `configs[]` array |
+| `POST /api/datasources/switch` | `{"name": "mysql-main", "config": "staging"}` | Calls `delegate.switchDatasource(name:to:)` |
+
+```bash
+TOKEN=$(cat /var/run/myapp-admin.token)
+
+# Switch mysql-main to the staging config
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-CSRF: 1" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"mysql-main","config":"staging"}' \
+  http://127.0.0.1:8990/api/datasources/switch | jq
+# {"success":true,"message":"Switched to staging (appdb_staging)","latencyMs":12.4}
+```
+
+Typical `id` values by framework:
+- **Lasso** — path to an alternate `.conf` file (e.g. `/etc/lasso/datasources/staging.conf`)
+- **MySQL pool** — a named profile key (e.g. `"staging"`) that triggers a pool reconnect
+- **Custom API** — an env profile name (`"dev"`, `"staging"`, `"prod"`) or any stable key
+
 ### AdminConsoleDelegate
 
 Implement this protocol (all methods have default implementations) to expose host-specific data and actions:
@@ -631,6 +658,30 @@ actor MyServer: AdminConsoleDelegate {
             throw AdminError.unknownHostname(hostname)
         }
         try await watcher.reload()
+    }
+
+    // Phase 5 — live config switching (Lasso example)
+    func availableConfigs(for datasource: String) async -> [DatasourceConfigInfo] {
+        guard datasource == "lasso-main" else { return [] }
+        return [
+            DatasourceConfigInfo(id: "/etc/lasso/ds/production.conf",
+                                 label: "Production", description: "mysql-prod / appdb",
+                                 isActive: currentConfig == "production"),
+            DatasourceConfigInfo(id: "/etc/lasso/ds/staging.conf",
+                                 label: "Staging", description: "mysql-stage / appdb_staging",
+                                 isActive: currentConfig == "staging"),
+        ]
+    }
+    func switchDatasource(name: String, to configID: String) async throws -> DatasourceTestResult {
+        let start = Date()
+        do {
+            try await lassoPool.reloadConfig(from: configID)
+            currentConfig = configID.contains("staging") ? "staging" : "production"
+            let ms = Date().timeIntervalSince(start) * 1000
+            return .ok(latencyMs: ms, message: "Switched to \(currentConfig)")
+        } catch {
+            return .failed(error.localizedDescription)
+        }
     }
 }
 ```
