@@ -79,6 +79,30 @@ public protocol AdminConsoleDelegate: AnyObject, Sendable {
     /// toast notification rather than a 500 error in the UI.
     func testDatasource(name: String) async throws -> DatasourceTestResult
 
+    // MARK: Phase 5 — live datasource config switching
+
+    /// The named configurations available for a specific datasource.
+    ///
+    /// Return an empty array (default) to suppress the config switcher for that datasource.
+    /// Mark exactly one entry `isActive: true` to show the current selection in the UI.
+    ///
+    /// - Note: Config identity is opaque — `id` is whatever string your host uses to
+    ///   identify a configuration (file path, env profile name, pool key, etc.). The admin
+    ///   console passes it back verbatim to `switchDatasource(name:to:)`.
+    func availableConfigs(for datasource: String) async -> [DatasourceConfigInfo]
+
+    /// Switch a named datasource to a different configuration at runtime.
+    ///
+    /// Only called with `configID` values returned by `availableConfigs(for:)`.
+    /// Return a `DatasourceTestResult` — the framework shows it as a toast and logs it.
+    /// Return `.failed("reason")` rather than throwing so the UI gets a clean message.
+    ///
+    /// Typical implementations:
+    /// - Lasso: reload a different `.conf` file and reinitialise the datasource alias
+    /// - MySQL pool: drain the pool and reconnect with new credentials from a different profile
+    /// - Custom API: swap environment variables and reconnect
+    func switchDatasource(name: String, to configID: String) async throws -> DatasourceTestResult
+
     /// Execute a custom action by name. Only called for names returned by `availableActions()`.
     /// Return `.failed` rather than throwing to send a friendly error message to the UI.
     func executeAction(_ name: String) async throws -> AdminActionResult
@@ -103,5 +127,9 @@ public extension AdminConsoleDelegate {
     func registeredDatasources() async -> [DatasourceInfo] { [] }
     func testDatasource(name: String) async throws -> DatasourceTestResult {
         .failed("No datasource named '\(name)' is registered")
+    }
+    func availableConfigs(for datasource: String) async -> [DatasourceConfigInfo] { [] }
+    func switchDatasource(name: String, to configID: String) async throws -> DatasourceTestResult {
+        .failed("Config switching not supported for '\(name)'")
     }
 }

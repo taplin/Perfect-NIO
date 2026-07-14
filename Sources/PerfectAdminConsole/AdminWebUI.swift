@@ -95,6 +95,8 @@ main{padding:20px;max-width:980px;margin:0 auto}
 /* ---- mini buttons (datasource test, tls ops) ---- */
 .mini-btn{padding:3px 9px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);cursor:pointer;font-size:11px;font-weight:600;white-space:nowrap}
 .mini-btn:hover{background:var(--accent);color:#fff}
+/* ---- config switcher ---- */
+.cfg-select{padding:3px 6px;border:1px solid var(--border);border-radius:5px;background:var(--card);color:var(--text);font-size:11px;cursor:pointer;max-width:120px}
 /* ---- actions section ---- */
 #actions-section{margin-top:14px}
 .action-btn{padding:5px 12px;border:1px solid var(--accent);border-radius:6px;background:transparent;color:var(--accent);cursor:pointer;font-size:12px;font-weight:600;transition:background .15s,color .15s}
@@ -321,12 +323,47 @@ function renderDatasources(d) {
   }
   el.innerHTML = d.datasources.map(ds => {
     const safeName = esc(ds.name).replace(/'/g, "\\'");
+    const active = (ds.configs || []).find(c => c.isActive);
+    const activeLabel = active
+      ? '<br><small style="color:var(--ok)">● ' + esc(active.label) + (active.description ? ' · ' + esc(active.description) : '') + '</small>'
+      : '';
+    // Config switcher: only shown when >1 config is available
+    const configs = ds.configs || [];
+    let controls = '';
+    if (configs.length > 1) {
+      const selId = 'cfg-' + ds.name.replace(/[^a-z0-9]/gi, '-');
+      const opts = configs.map(c =>
+        '<option value="' + esc(c.id) + '"' + (c.isActive ? ' selected' : '') + '>' + esc(c.label) + '</option>'
+      ).join('');
+      controls += '<select id="' + selId + '" class="cfg-select">' + opts + '</select> ';
+      controls += '<button class="mini-btn" onclick="switchDS(\'' + safeName + '\',document.getElementById(\'' + selId + '\').value)">Switch</button> ';
+    }
+    controls += '<button class="mini-btn" onclick="testDS(\'' + safeName + '\')">Test</button>';
     return '<div class="row">' +
-      '<span class="rl">' + esc(ds.alias || ds.name) +
+      '<span class="rl">' + esc(ds.alias || ds.name) + activeLabel +
       '<br><small style="color:var(--muted)">' + esc(ds.driver) + ' · ' + esc(ds.schema) + '</small></span>' +
-      '<button class="mini-btn" onclick="testDS(\'' + safeName + '\')">Test</button>' +
+      '<span class="rv" style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;align-items:center">' + controls + '</span>' +
       '</div>';
   }).join('');
+}
+
+async function switchDS(name, configID) {
+  if (!configID) return;
+  try {
+    const r = await fetch('/api/datasources/switch', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'X-Admin-CSRF': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, config: configID })
+    });
+    if (r.status === 401) { logout(); return; }
+    const data = await r.json();
+    const latency = data.latencyMs != null ? ' (' + Math.round(data.latencyMs) + 'ms)' : '';
+    showToast(name + ': ' + data.message + latency, data.success ? 'ok' : 'err');
+    // Refresh datasource card so the active config label updates
+    if (data.success) api('/api/datasources').then(renderDatasources).catch(() => {});
+  } catch(e) {
+    showToast('Switch failed: ' + e.message, 'err');
+  }
 }
 
 async function testDS(name) {

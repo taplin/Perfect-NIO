@@ -16,6 +16,10 @@
 //          audit trail written to LogCapture.
 // Phase 3: Datasource management — GET /api/datasources, POST /api/datasources/test.
 //          DatasourceInfo (sanitized, no credentials) + on-demand ping via delegate.
+// Phase 5: Live config switching — POST /api/datasources/switch.
+//          DatasourceConfigInfo (opaque id, label, description, isActive).
+//          Delegate supplies available configs; host decides what switching means
+//          (Lasso: reload a .conf file; MySQL pool: reconnect; custom API: swap env profile).
 // Phase 4: In-process metrics (GET /api/metrics via AdminMetrics actor),
 //          per-domain TLS ops (POST /api/tls/reload, DELETE /api/tls/domain).
 //
@@ -187,15 +191,24 @@ public actor AdminConsole {
 
         // ── Phase 3: datasource management ───────────────────────────────────
 
-        // GET /api/datasources — list all registered datasources (sanitized, no credentials)
+        // GET /api/datasources — list all registered datasources with available configs
+        // Each entry includes configs[] so the UI can show a switcher without a second request.
+        // Configs are empty for datasources that don't implement availableConfigs(for:).
         let datasourcesRoute = root().GET.path("api").path("datasources").map { (req: any HTTPRequest) async throws -> HTTPOutput in
             try tokenStore.requireAuth(from: req.headers)
             let sources = await delegate?.registeredDatasources() ?? []
-            struct DSEnc: Encodable { let name, alias, schema, driver: String }
+            struct ConfigEnc: Encodable { let id, label, description: String; let isActive: Bool }
+            struct DSEnc: Encodable { let name, alias, schema, driver: String; let configs: [ConfigEnc] }
             struct DSListEnc: Encodable { let datasources: [DSEnc] }
-            return try JSONOutput(DSListEnc(datasources: sources.map {
-                DSEnc(name: $0.name, alias: $0.alias, schema: $0.schema, driver: $0.driver)
-            }))
+            var encoded: [DSEnc] = []
+            for source in sources {
+                let configs = await delegate?.availableConfigs(for: source.name) ?? []
+                encoded.append(DSEnc(
+                    name: source.name, alias: source.alias, schema: source.schema, driver: source.driver,
+                    configs: configs.map { ConfigEnc(id: $0.id, label: $0.label, description: $0.description, isActive: $0.isActive) }
+                ))
+            }
+            return try JSONOutput(DSListEnc(datasources: encoded))
         }
 
         // POST /api/datasources/test — ping a named datasource on demand
@@ -212,6 +225,25 @@ public actor AdminConsole {
                 result = .failed("No delegate configured")
             }
             await logCapture?.capture("[admin] datasource-test name=\(body.name) success=\(result.success): \(result.message)")
+            struct ResultEnc: Encodable { let success: Bool; let message: String; let latencyMs: Double? }
+            return try JSONOutput(ResultEnc(success: result.success, message: result.message, latencyMs: result.latencyMs))
+        }
+
+        // POST /api/datasources/switch — live config switch for a named datasource
+        let datasourceSwitchRoute = root().POST.path("api").path("datasources").path("switch").map { (req: any HTTPRequest) async throws -> HTTPOutput in
+            try tokenStore.requireAuth(from: req.headers)
+            try requireCSRF(headers: req.headers, port: adminPort)
+            let bytes = try await adminReadJSONBody(req)
+            struct Body: Decodable { let name: String; let config: String }
+            let body = try JSONDecoder().decode(Body.self, from: Data(bytes))
+            let result: DatasourceTestResult
+            if let del = delegate {
+                result = (try? await del.switchDatasource(name: body.name, to: body.config))
+                    ?? .failed("Switch threw an unexpected error")
+            } else {
+                result = .failed("No delegate configured")
+            }
+            await logCapture?.capture("[admin] datasource-switch name=\(body.name) config=\(body.config) success=\(result.success): \(result.message)")
             struct ResultEnc: Encodable { let success: Bool; let message: String; let latencyMs: Double? }
             return try JSONOutput(ResultEnc(success: result.success, message: result.message, latencyMs: result.latencyMs))
         }
@@ -324,7 +356,7 @@ public actor AdminConsole {
         }
 
         return try root().dir(uiRoute, statusRoute, tlsRoute, acmeRoute, logsRoute, routesRoute,
-                              datasourcesRoute, datasourceTestRoute,
+                              datasourcesRoute, datasourceTestRoute, datasourceSwitchRoute,
                               metricsRoute, tlsReloadRoute, tlsRemoveRoute,
                               actionsGetRoute, actionsPostRoute, clearLogsRoute)
     }

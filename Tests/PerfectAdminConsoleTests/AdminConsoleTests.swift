@@ -763,3 +763,100 @@ final class AdminWebUIPhase4Tests: XCTestCase {
         XCTAssertTrue(html.contains("/api/tls/domain"), "TLS remove endpoint missing from JS")
     }
 }
+
+// MARK: - Phase 5: DatasourceConfigInfo
+
+final class DatasourceConfigInfoTests: XCTestCase {
+
+    func testInit_storesAllFields() {
+        let cfg = DatasourceConfigInfo(id: "staging", label: "Staging", description: "staging.db", isActive: true)
+        XCTAssertEqual(cfg.id, "staging")
+        XCTAssertEqual(cfg.label, "Staging")
+        XCTAssertEqual(cfg.description, "staging.db")
+        XCTAssertTrue(cfg.isActive)
+    }
+
+    func testInit_isActiveDefaultsFalse() {
+        let cfg = DatasourceConfigInfo(id: "prod", label: "Production", description: "prod.db")
+        XCTAssertFalse(cfg.isActive)
+    }
+
+    func testInit_emptyStringsAllowed() {
+        let cfg = DatasourceConfigInfo(id: "", label: "", description: "")
+        XCTAssertEqual(cfg.id, "")
+        XCTAssertEqual(cfg.label, "")
+        XCTAssertEqual(cfg.description, "")
+    }
+
+    func testSendable_usableAcrossActors() async {
+        let cfg = DatasourceConfigInfo(id: "dev", label: "Dev", description: "dev.db", isActive: false)
+        let result = await Task.detached { cfg }.value
+        XCTAssertEqual(result.id, "dev")
+    }
+}
+
+// MARK: - Phase 5: AdminConsoleDelegate defaults
+
+private final class MinimalDelegate5: AdminConsoleDelegate {}
+
+final class AdminConsoleDelegatePhase5Tests: XCTestCase {
+
+    func testDefaultAvailableConfigs_isEmpty() async {
+        let d = MinimalDelegate5()
+        let configs = await d.availableConfigs(for: "mysql-main")
+        XCTAssertTrue(configs.isEmpty, "Default availableConfigs should return empty array")
+    }
+
+    func testDefaultSwitchDatasource_returnsFailed() async throws {
+        let d = MinimalDelegate5()
+        let result = try await d.switchDatasource(name: "mysql-main", to: "staging")
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.message.contains("mysql-main"), "Error message should name the datasource")
+    }
+
+    func testDefaultSwitchDatasource_latencyIsNil() async throws {
+        let d = MinimalDelegate5()
+        let result = try await d.switchDatasource(name: "any", to: "any-config")
+        XCTAssertNil(result.latencyMs)
+    }
+}
+
+// MARK: - Phase 5: AdminWebUI config switcher
+
+final class AdminWebUIPhase5Tests: XCTestCase {
+
+    private func loadHTML() async throws -> String {
+        let output = AdminWebUI.response(tokenFilePath: "/tmp/tok.token")
+        var body: [UInt8] = []
+        let alloc = ByteBufferAllocator()
+        var chunk = try await output.nextChunk(allocator: alloc)
+        while let buf = chunk {
+            body.append(contentsOf: buf.readableBytesView)
+            chunk = try await output.nextChunk(allocator: alloc)
+        }
+        return String(decoding: body, as: UTF8.self)
+    }
+
+    func testResponse_containsCfgSelectCSS() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("cfg-select"), "cfg-select CSS class missing from HTML")
+    }
+
+    func testResponse_containsSwitchDSFunction() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("switchDS"), "switchDS JS function missing from HTML")
+    }
+
+    func testResponse_containsDatasourceSwitchEndpoint() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("/api/datasources/switch"), "datasource switch endpoint missing from JS")
+    }
+
+    func testResponse_switchDSPostsWithCSRFHeader() async throws {
+        let html = try await loadHTML()
+        // switchDS must use POST and include the CSRF header
+        let hasPost = html.contains("method: 'POST'") || html.contains("method:\"POST\"") || html.contains("method: \"POST\"")
+        XCTAssertTrue(hasPost, "switchDS should use POST method")
+        XCTAssertTrue(html.contains("X-Admin-CSRF"), "switchDS must include X-Admin-CSRF header")
+    }
+}

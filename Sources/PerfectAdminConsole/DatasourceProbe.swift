@@ -19,6 +19,38 @@
 
 import Foundation
 
+/// Describes one named configuration that a datasource can be switched to at runtime.
+///
+/// Config switching is intentionally framework-agnostic: the `id` is an opaque string
+/// passed back to `AdminConsoleDelegate.switchDatasource(name:to:)`. The host decides
+/// what it means — a file path, an environment name, a key in a config dictionary, etc.
+///
+/// **Examples:**
+/// - Lasso: id = path to an alternate `.conf` file
+/// - MySQL pool: id = `"staging"` triggering a host reconfiguration in the pool
+/// - Custom API: id = an env profile name (`"dev"`, `"staging"`, `"prod"`)
+///
+/// Credentials must never appear in `label` or `description`. Those fields are
+/// displayed to whoever has authenticated to the admin console.
+public struct DatasourceConfigInfo: Sendable {
+    /// Opaque identifier passed to `switchDatasource(name:to:)`. Use stable lowercase-kebab strings.
+    public let id: String
+    /// Short human-readable label shown in the switcher dropdown (e.g. `"Staging"`, `"Production"`).
+    public let label: String
+    /// One-line description displayed below the label — schema name, server alias, or similar.
+    /// Never include passwords, tokens, or connection strings containing credentials.
+    public let description: String
+    /// Whether this config is currently active. The UI highlights the active entry.
+    public let isActive: Bool
+
+    public init(id: String, label: String, description: String, isActive: Bool = false) {
+        self.id = id
+        self.label = label
+        self.description = description
+        self.isActive = isActive
+    }
+}
+
 /// Sanitized description of one datasource connection.
 ///
 /// **No password or host credentials.** Return only what is safe to display
