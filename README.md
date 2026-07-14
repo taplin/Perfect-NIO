@@ -23,6 +23,7 @@ A Swift 6 HTTP(S) server library built on SwiftNIO. Routes are a composable, str
 - [Custom HTTPOutput](#custom-httpoutput)
 - [WebSocket](#websocket)
 - [TLS / HTTPS](#tls--https)
+- [Admin console](#admin-console)
 - [Reference](#reference)
 - [Linux support](#linux-support)
 
@@ -450,6 +451,147 @@ let tls  = TLSConfiguration.makeServerConfiguration(
 )
 
 try await Server(routes: routes, port: 443, tls: tls).run()
+```
+
+---
+
+## Admin console
+
+`PerfectAdminConsole` is an optional SPM library target that starts a lightweight read/write admin server bound exclusively to `127.0.0.1`. It is never included unless the host application explicitly depends on it.
+
+### Package.swift
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/taplin/Perfect-NIO.git", branch: "main"),
+],
+targets: [
+    .target(
+        name: "MyServer",
+        dependencies: [
+            .product(name: "PerfectNIO", package: "Perfect-NIO"),
+            .product(name: "PerfectAdminConsole", package: "Perfect-NIO"),
+        ]
+    ),
+]
+```
+
+### Basic setup
+
+```swift
+import PerfectAdminConsole
+
+let logCapture = LogCapture()          // optional — omit if you don't need log tail
+let admin = try AdminConsole(
+    port: 8990,
+    tokenFilePath: "/var/run/myapp-admin.token",
+    tlsManager: certManager,           // optional — from PerfectNIO TLS setup
+    acmeResponder: acme,               // optional
+    logCapture: logCapture,
+    delegate: myServer                 // optional — see AdminConsoleDelegate below
+)
+async let _ = admin.run()             // binds 127.0.0.1:8990, prints token path to stderr
+```
+
+The token file is created at startup with `chmod 600`. Read it once to authenticate:
+
+```bash
+TOKEN=$(cat /var/run/myapp-admin.token)
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8990/api/status | jq
+```
+
+### Phase 1 — read-only API
+
+All endpoints require `Authorization: Bearer <token>`.
+
+| Endpoint | Response |
+|---|---|
+| `GET /` | HTML dashboard (no auth — loads the token-entry form) |
+| `GET /api/status` | Server uptime, TLS domain count, ACME pending challenges, delegate sections |
+| `GET /api/tls` | `{domains: [String], hasDefault: Bool}` |
+| `GET /api/acme` | `{pendingChallenges: Int}` |
+| `GET /api/logs?count=N` | `{lines: [String], totalCaptured: Int}` — last N lines from `LogCapture` |
+| `GET /api/routes` | `{routes: [String]}` — from delegate |
+| `GET /api/actions` | `{actions: [...]}` — available actions (built-in + delegate) |
+
+### Phase 2 — mutating API
+
+Mutating endpoints additionally require `X-Admin-CSRF: 1`. When an `Origin` header is present it must equal `http://127.0.0.1:<port>`.
+
+| Endpoint | Body | Effect |
+|---|---|---|
+| `POST /api/actions` | `{"action": "clear-logs"}` | Execute an action by name |
+| `POST /api/actions` | `{"action": "reload-tls"}` | Ask delegate to reload TLS certs |
+| `DELETE /api/logs` | — | Clear the log ring buffer immediately |
+
+```bash
+TOKEN=$(cat /var/run/myapp-admin.token)
+
+# Clear logs
+curl -s -X DELETE \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-CSRF: 1" \
+  http://127.0.0.1:8990/api/logs | jq
+
+# Execute an action
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-CSRF: 1" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"reload-tls"}' \
+  http://127.0.0.1:8990/api/actions | jq
+```
+
+### AdminConsoleDelegate
+
+Implement this protocol (all methods are optional via default implementations) to expose host-specific data and actions:
+
+```swift
+import PerfectAdminConsole
+
+actor MyServer: AdminConsoleDelegate {
+    var serverPort: Int { 9090 }
+    var serverStartTime: Date { startedAt }
+    var registeredRoutes: [RouteInfo] {
+        routes.describe.map { RouteInfo(uri: $0.uri) }
+    }
+
+    func additionalStatusSections() async -> [AdminStatusSection] {
+        [AdminStatusSection(title: "Database", items: [
+            ("host", dbHost),
+            ("pool size", "\(pool.count)"),
+        ])]
+    }
+
+    func availableActions() async -> [AdminAction] {
+        [AdminAction(name: "flush-cache", label: "Flush Cache",
+                     description: "Evict all cached responses.", category: "maintenance")]
+    }
+
+    func executeAction(_ name: String) async throws -> AdminActionResult {
+        switch name {
+        case "flush-cache": cache.removeAll(); return .ok("Cache flushed")
+        default: return .failed("Unknown action: \(name)")
+        }
+    }
+
+    func reloadTLSCertificates() async throws {
+        try await certManager.setCertificate(for: "example.com", config: loadCert())
+    }
+}
+```
+
+### LogCapture — feeding log lines
+
+`LogCapture` is a Swift actor with a configurable ring buffer (default 500 lines). Integrate it with your logging stack:
+
+```swift
+let capture = LogCapture(capacity: 500)
+
+// Manual:
+await capture.capture("2026-07-14 10:00:00 [INFO] Server started")
+
+// With swift-log via MultiplexLogHandler + a custom LogHandler that calls capture.capture(_:)
 ```
 
 ---
