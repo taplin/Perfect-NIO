@@ -514,72 +514,147 @@ All endpoints require `Authorization: Bearer <token>`.
 | `GET /api/routes` | `{routes: [String]}` — from delegate |
 | `GET /api/actions` | `{actions: [...]}` — available actions (built-in + delegate) |
 
-### Phase 2 — mutating API
+### Phase 2 — actions and CSRF
 
-Mutating endpoints additionally require `X-Admin-CSRF: 1`. When an `Origin` header is present it must equal `http://127.0.0.1:<port>`.
+Mutating endpoints require `Authorization: Bearer <token>` **and** `X-Admin-CSRF: 1`. When an `Origin` header is present it must equal `http://127.0.0.1:<port>`.
 
 | Endpoint | Body | Effect |
 |---|---|---|
-| `POST /api/actions` | `{"action": "clear-logs"}` | Execute an action by name |
-| `POST /api/actions` | `{"action": "reload-tls"}` | Ask delegate to reload TLS certs |
-| `DELETE /api/logs` | — | Clear the log ring buffer immediately |
+| `GET /api/actions` | — | List built-in + delegate actions |
+| `POST /api/actions` | `{"action": "clear-logs"}` | Clear the log ring buffer |
+| `POST /api/actions` | `{"action": "reload-tls"}` | Ask delegate to reload all TLS certs |
+| `DELETE /api/logs` | — | Clear log ring buffer immediately |
+
+### Phase 3 — datasource management
+
+| Endpoint | Body | Response |
+|---|---|---|
+| `GET /api/datasources` | — | `{datasources: [{name, alias, schema, driver}]}` |
+| `POST /api/datasources/test` | `{"name": "mysql-main"}` | `{success, message, latencyMs?}` |
 
 ```bash
 TOKEN=$(cat /var/run/myapp-admin.token)
 
-# Clear logs
-curl -s -X DELETE \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "X-Admin-CSRF: 1" \
-  http://127.0.0.1:8990/api/logs | jq
+# List datasources
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8990/api/datasources | jq
 
-# Execute an action
+# Test a specific connection
 curl -s -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "X-Admin-CSRF: 1" \
   -H "Content-Type: application/json" \
-  -d '{"action":"reload-tls"}' \
-  http://127.0.0.1:8990/api/actions | jq
+  -d '{"name":"mysql-main"}' \
+  http://127.0.0.1:8990/api/datasources/test | jq
+```
+
+### Phase 4 — TLS operations and metrics
+
+| Endpoint | Body | Effect |
+|---|---|---|
+| `GET /api/metrics` | — | `{totalRequests, totalErrors, activeConnections, routeCounts, errorRate}` |
+| `POST /api/tls/reload` | `{"hostname": "example.com"}` | Hot-reload cert via `delegate.reloadTLSCertificate(for:)` |
+| `DELETE /api/tls/domain` | `{"hostname": "example.com"}` | Remove hostname from live TLS map |
+
+```bash
+TOKEN=$(cat /var/run/myapp-admin.token)
+
+# Metrics snapshot
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8990/api/metrics | jq
+
+# Reload a specific domain's cert (after certbot renewed it)
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-CSRF: 1" \
+  -H "Content-Type: application/json" \
+  -d '{"hostname":"example.com"}' \
+  http://127.0.0.1:8990/api/tls/reload | jq
+
+# Remove a domain from the live TLS map
+curl -s -X DELETE \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-CSRF: 1" \
+  -H "Content-Type: application/json" \
+  -d '{"hostname":"old-tenant.example.com"}' \
+  http://127.0.0.1:8990/api/tls/domain | jq
 ```
 
 ### AdminConsoleDelegate
 
-Implement this protocol (all methods are optional via default implementations) to expose host-specific data and actions:
+Implement this protocol (all methods have default implementations) to expose host-specific data and actions:
 
 ```swift
 import PerfectAdminConsole
 
 actor MyServer: AdminConsoleDelegate {
+    // Phase 1 — status
     var serverPort: Int { 9090 }
     var serverStartTime: Date { startedAt }
-    var registeredRoutes: [RouteInfo] {
-        routes.describe.map { RouteInfo(uri: $0.uri) }
-    }
-
+    var registeredRoutes: [RouteInfo] { routes.map { RouteInfo(uri: $0.key) } }
     func additionalStatusSections() async -> [AdminStatusSection] {
-        [AdminStatusSection(title: "Database", items: [
-            ("host", dbHost),
-            ("pool size", "\(pool.count)"),
-        ])]
+        [AdminStatusSection(title: "Database", items: [("pool", "\(pool.count)")])]
     }
 
+    // Phase 2 — actions
     func availableActions() async -> [AdminAction] {
         [AdminAction(name: "flush-cache", label: "Flush Cache",
                      description: "Evict all cached responses.", category: "maintenance")]
     }
-
     func executeAction(_ name: String) async throws -> AdminActionResult {
         switch name {
         case "flush-cache": cache.removeAll(); return .ok("Cache flushed")
         default: return .failed("Unknown action: \(name)")
         }
     }
-
     func reloadTLSCertificates() async throws {
         try await certManager.setCertificate(for: "example.com", config: loadCert())
     }
+
+    // Phase 3 — datasources
+    func registeredDatasources() async -> [DatasourceInfo] {
+        [DatasourceInfo(name: "mysql-main", alias: "MainDB", schema: "appdb", driver: "MySQL")]
+    }
+    func testDatasource(name: String) async throws -> DatasourceTestResult {
+        let start = Date()
+        do {
+            try await pool.ping()
+            return .ok(latencyMs: Date().timeIntervalSince(start) * 1000)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    // Phase 4 — TLS per-domain reload
+    func reloadTLSCertificate(for hostname: String) async throws {
+        guard let watcher = certWatchers[hostname] else {
+            throw AdminError.unknownHostname(hostname)
+        }
+        try await watcher.reload()
+    }
 }
 ```
+
+### AdminMetrics — request counters
+
+Pass an `AdminMetrics` instance to `AdminConsole.init` and feed it from your route handlers:
+
+```swift
+let metrics = AdminMetrics()
+let admin = try AdminConsole(port: 8990, tokenFilePath: tokenPath, metrics: metrics)
+
+// In each route handler:
+await metrics.recordRequest(route: "GET:///api/posts")
+
+// On error paths:
+await metrics.recordError()
+
+// Around TCP connections (optional):
+await metrics.beginConnection()
+defer { Task { await metrics.endConnection() } }
+```
+
+`GET /api/metrics` returns a snapshot with `totalRequests`, `totalErrors`, `activeConnections`, `routeCounts` (top routes by name), and a computed `errorRate`.
 
 ### LogCapture — feeding log lines
 
