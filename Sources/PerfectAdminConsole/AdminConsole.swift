@@ -11,6 +11,9 @@
 //
 // Phase 1 features: status card, TLS domain list, ACME challenge count,
 // log tail (ring buffer), and route inspector via delegate.
+// Phase 2 features: CSRF protection on mutating routes, actions framework
+// (GET /api/actions, POST /api/actions), log buffer clear (DELETE /api/logs),
+// audit trail written to LogCapture.
 //
 // Security model:
 //   - Binds exclusively to 127.0.0.1; no configuration option to change this.
@@ -174,6 +177,104 @@ public actor AdminConsole {
             return try JSONOutput(RoutesEnc(routes: uris))
         }
 
-        return try root().dir(uiRoute, statusRoute, tlsRoute, acmeRoute, logsRoute, routesRoute)
+        // ── Phase 2: mutating routes ──────────────────────────────────────────
+
+        // GET /api/actions — list built-in + delegate actions
+        let actionsGetRoute = root().GET.path("api").path("actions").map { (req: any HTTPRequest) async throws -> HTTPOutput in
+            try tokenStore.requireAuth(from: req.headers)
+            let builtins = adminBuiltinActions(hasLogs: logCapture != nil, hasDelegate: delegate != nil)
+            let custom = await delegate?.availableActions() ?? []
+            struct ActionEnc: Encodable {
+                let name, label, description, category: String
+                let isDestructive: Bool
+            }
+            struct ActionsEnc: Encodable { let actions: [ActionEnc] }
+            let all = (builtins + custom).map {
+                ActionEnc(name: $0.name, label: $0.label, description: $0.description,
+                          category: $0.category, isDestructive: $0.isDestructive)
+            }
+            return try JSONOutput(ActionsEnc(actions: all))
+        }
+
+        // POST /api/actions — execute an action by name
+        let actionsPostRoute = root().POST.path("api").path("actions").map { (req: any HTTPRequest) async throws -> HTTPOutput in
+            try tokenStore.requireAuth(from: req.headers)
+            try requireCSRF(headers: req.headers, port: adminPort)
+            let bytes = try await adminReadJSONBody(req)
+            struct Body: Decodable { let action: String }
+            let body = try JSONDecoder().decode(Body.self, from: Data(bytes))
+
+            let result: AdminActionResult
+            switch body.action {
+            case "clear-logs":
+                let dropped = await logCapture?.clear() ?? 0
+                result = .ok("Log buffer cleared — \(dropped) line\(dropped == 1 ? "" : "s") dropped")
+            case "reload-tls":
+                do {
+                    try await delegate?.reloadTLSCertificates()
+                    result = .ok("TLS certificates reloaded")
+                } catch {
+                    result = .failed("TLS reload failed: \(error.localizedDescription)")
+                }
+            default:
+                guard let del = delegate else {
+                    throw ErrorOutput(status: .notFound, description: "Unknown action: \(body.action)")
+                }
+                result = try await del.executeAction(body.action)
+            }
+
+            await logCapture?.capture("[admin] action=\(body.action) success=\(result.success): \(result.message)")
+
+            struct ResultEnc: Encodable { let success: Bool; let message: String }
+            return try JSONOutput(ResultEnc(success: result.success, message: result.message))
+        }
+
+        // DELETE /api/logs — clear the log ring buffer immediately
+        let clearLogsRoute = root().DELETE.path("api").path("logs").map { (req: any HTTPRequest) async throws -> HTTPOutput in
+            try tokenStore.requireAuth(from: req.headers)
+            try requireCSRF(headers: req.headers, port: adminPort)
+            let dropped = await logCapture?.clear() ?? 0
+            await logCapture?.capture("[admin] log buffer cleared — \(dropped) line\(dropped == 1 ? "" : "s") dropped")
+            struct ClearEnc: Encodable { let dropped: Int }
+            return try JSONOutput(ClearEnc(dropped: dropped))
+        }
+
+        return try root().dir(uiRoute, statusRoute, tlsRoute, acmeRoute, logsRoute, routesRoute,
+                              actionsGetRoute, actionsPostRoute, clearLogsRoute)
     }
+}
+
+// MARK: - Internal helpers (internal so tests can reach them via @testable import)
+
+/// Built-in actions always offered by the admin console (when the relevant subsystem is configured).
+func adminBuiltinActions(hasLogs: Bool, hasDelegate: Bool) -> [AdminAction] {
+    var actions: [AdminAction] = []
+    if hasLogs {
+        actions.append(AdminAction(
+            name: "clear-logs",
+            label: "Clear Log Buffer",
+            description: "Remove all lines from the in-memory log ring buffer.",
+            category: "maintenance",
+            isDestructive: true
+        ))
+    }
+    if hasDelegate {
+        actions.append(AdminAction(
+            name: "reload-tls",
+            label: "Reload TLS Certificates",
+            description: "Ask the host to reload TLS certificates from disk without restarting.",
+            category: "tls",
+            isDestructive: false
+        ))
+    }
+    return actions
+}
+
+/// Reads the full request body and returns it as raw bytes.
+/// Content-type must be `application/json`; other types return empty bytes without error
+/// so the downstream decoder produces a clean `DecodingError`.
+func adminReadJSONBody(_ req: any HTTPRequest) async throws -> [UInt8] {
+    let content = try await req.readContent()
+    if case .other(let bytes) = content { return bytes }
+    return []
 }

@@ -8,10 +8,13 @@
 //===----------------------------------------------------------------------===//
 //
 // AdminConsoleDelegate — protocol for the host application to supply live
-// server state to the admin console's status and route displays.
+// server state to the admin console's status, route, and action displays.
 //
 // All methods have default no-op implementations: conformance is additive.
 // The host implements only what it wants to expose.
+//
+// Phase 1: status sections, route inspector
+// Phase 2: custom actions, TLS certificate reload
 
 import Foundation
 
@@ -36,6 +39,8 @@ public struct AdminStatusSection: Sendable {
 /// Protocol for the host application to supply live server state to the admin console.
 /// Conformers must be `Sendable`; actors satisfy this automatically.
 public protocol AdminConsoleDelegate: AnyObject, Sendable {
+    // MARK: Phase 1 — status display
+
     /// The port the main application server is listening on. Return 0 to omit.
     var serverPort: Int { get }
     /// When the server process started — used for uptime display.
@@ -44,6 +49,21 @@ public protocol AdminConsoleDelegate: AnyObject, Sendable {
     var registeredRoutes: [RouteInfo] { get }
     /// Optional extra sections shown below the standard status cards.
     func additionalStatusSections() async -> [AdminStatusSection]
+
+    // MARK: Phase 2 — actions
+
+    /// Custom actions offered by this host. Combined with built-in actions in the console.
+    /// Return an empty array (default) to suppress the actions panel.
+    func availableActions() async -> [AdminAction]
+
+    /// Execute a custom action by name. Only called for names returned by `availableActions()`.
+    /// Return `.failed` rather than throwing to send a friendly error message to the UI.
+    func executeAction(_ name: String) async throws -> AdminActionResult
+
+    /// Called when the operator triggers the built-in "reload-tls" action.
+    /// Implement to re-read certificate PEM files and push them to your `TLSContextManager`.
+    /// Default implementation is a no-op (the built-in action will report success silently).
+    func reloadTLSCertificates() async throws
 }
 
 public extension AdminConsoleDelegate {
@@ -51,4 +71,9 @@ public extension AdminConsoleDelegate {
     var serverStartTime: Date { .distantFuture }
     var registeredRoutes: [RouteInfo] { [] }
     func additionalStatusSections() async -> [AdminStatusSection] { [] }
+    func availableActions() async -> [AdminAction] { [] }
+    func executeAction(_ name: String) async throws -> AdminActionResult {
+        .failed("Unknown action: \(name)")
+    }
+    func reloadTLSCertificates() async throws {}
 }

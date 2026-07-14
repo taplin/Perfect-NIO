@@ -92,6 +92,18 @@ main{padding:20px;max-width:980px;margin:0 auto}
 .log-footer{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:8px}
 /* ---- delegate sections ---- */
 #delegate-cards{margin-top:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+/* ---- actions section ---- */
+#actions-section{margin-top:14px}
+.action-btn{padding:5px 12px;border:1px solid var(--accent);border-radius:6px;background:transparent;color:var(--accent);cursor:pointer;font-size:12px;font-weight:600;transition:background .15s,color .15s}
+.action-btn:hover{background:var(--accent);color:#fff}
+.action-btn.destructive{border-color:var(--err);color:var(--err)}
+.action-btn.destructive:hover{background:var(--err);color:#fff}
+/* ---- toasts ---- */
+#toast-container{position:fixed;bottom:20px;right:20px;display:flex;flex-direction:column;gap:8px;z-index:100;pointer-events:none}
+.toast{padding:10px 16px;border-radius:8px;font-size:13px;background:var(--card);border:1px solid var(--border);box-shadow:0 2px 8px rgba(0,0,0,.18);max-width:320px;transition:opacity .4s;pointer-events:auto}
+.toast-ok{border-left:3px solid var(--ok)}
+.toast-err{border-left:3px solid var(--err)}
+.toast-fade{opacity:0}
 </style>
 </head>
 <body>
@@ -127,8 +139,10 @@ main{padding:20px;max-width:980px;margin:0 auto}
       </div>
     </div>
     <div id="delegate-cards"></div>
+    <div id="actions-section"></div>
   </main>
 </div>
+<div id="toast-container"></div>
 
 <script>
 'use strict';
@@ -240,6 +254,72 @@ function renderDelegate(sections) {
   }).join('');
 }
 
+// ---- Phase 2: actions ----
+
+async function loadActions() {
+  try {
+    const data = await api('/api/actions');
+    renderActions(data.actions || []);
+  } catch(e) { /* silent — actions section simply stays empty */ }
+}
+
+function renderActions(actions) {
+  const el = document.getElementById('actions-section');
+  if (!actions.length) { el.innerHTML = ''; return; }
+  // Group by category
+  const cats = {};
+  for (const a of actions) {
+    const c = a.category || 'general';
+    (cats[c] = cats[c] || []).push(a);
+  }
+  let h = '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px">Actions</div>';
+  h += '<div class="grid">';
+  for (const [cat, acts] of Object.entries(cats)) {
+    h += '<div class="card"><h2>' + esc(cat) + '</h2>';
+    for (const a of acts) {
+      h += '<div class="row" style="flex-direction:column;align-items:flex-start;gap:4px;padding:10px 0">';
+      h += '<div style="display:flex;justify-content:space-between;width:100%;align-items:center;gap:8px">';
+      h += '<strong style="font-size:13px">' + esc(a.label) + '</strong>';
+      const cls = 'action-btn' + (a.isDestructive ? ' destructive' : '');
+      const escaped = esc(a.name).replace(/'/g, "\\'");
+      h += '<button class="' + cls + '" onclick="runAction(\'' + escaped + '\',' + (a.isDestructive ? 'true' : 'false') + ')">';
+      h += a.isDestructive ? 'Run (!)' : 'Run';
+      h += '</button></div>';
+      if (a.description) h += '<span style="color:var(--muted);font-size:12px">' + esc(a.description) + '</span>';
+      h += '</div>';
+    }
+    h += '</div>';
+  }
+  h += '</div>';
+  el.innerHTML = h;
+}
+
+async function runAction(name, isDestructive) {
+  if (isDestructive && !confirm('This action is destructive. Proceed?')) return;
+  try {
+    const r = await fetch('/api/actions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'X-Admin-CSRF': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: name })
+    });
+    if (r.status === 401) { logout(); return; }
+    const result = await r.json();
+    showToast(result.message, result.success ? 'ok' : 'err');
+    // Immediately refresh the log view if we just cleared it
+    if (name === 'clear-logs') api('/api/logs?count=100').then(renderLogs).catch(() => {});
+  } catch(e) {
+    showToast('Action failed: ' + e.message, 'err');
+  }
+}
+
+function showToast(msg, type) {
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + (type || 'ok');
+  t.textContent = msg;
+  document.getElementById('toast-container').appendChild(t);
+  setTimeout(() => { t.classList.add('toast-fade'); setTimeout(() => t.remove(), 400); }, 3500);
+}
+
 async function connect() {
   const input = document.getElementById('token-input').value.trim();
   if (!input) return;
@@ -269,6 +349,7 @@ function showDashboard() {
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
   refresh();
+  loadActions();
   clearInterval(refreshIntervalId);
   countdown = 5;
   refreshIntervalId = setInterval(() => {

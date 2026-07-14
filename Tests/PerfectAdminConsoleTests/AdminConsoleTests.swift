@@ -255,4 +255,211 @@ final class AdminWebUITests: XCTestCase {
         let cc = head?.headers.first(name: "Cache-Control") ?? ""
         XCTAssertEqual(cc, "no-store")
     }
+
+    func testResponse_containsActionsSection() async throws {
+        let output = AdminWebUI.response(tokenFilePath: "/tmp/tok.token")
+        var body: [UInt8] = []
+        let alloc = ByteBufferAllocator()
+        var chunk = try await output.nextChunk(allocator: alloc)
+        while let buf = chunk {
+            body.append(contentsOf: buf.readableBytesView)
+            chunk = try await output.nextChunk(allocator: alloc)
+        }
+        let html = String(decoding: body, as: UTF8.self)
+        XCTAssertTrue(html.contains("actions-section"), "Phase 2 actions section missing from HTML")
+        XCTAssertTrue(html.contains("toast-container"), "Phase 2 toast container missing from HTML")
+    }
+}
+
+// MARK: - AdminAction / AdminActionResult
+
+final class AdminActionTests: XCTestCase {
+
+    func testAdminAction_storesAllFields() {
+        let a = AdminAction(name: "my-action", label: "My Action",
+                            description: "Does something", category: "ops", isDestructive: true)
+        XCTAssertEqual(a.name, "my-action")
+        XCTAssertEqual(a.label, "My Action")
+        XCTAssertEqual(a.description, "Does something")
+        XCTAssertEqual(a.category, "ops")
+        XCTAssertTrue(a.isDestructive)
+    }
+
+    func testAdminAction_defaultCategoryIsGeneral() {
+        let a = AdminAction(name: "x", label: "X", description: "")
+        XCTAssertEqual(a.category, "general")
+    }
+
+    func testAdminAction_defaultNonDestructive() {
+        let a = AdminAction(name: "x", label: "X", description: "")
+        XCTAssertFalse(a.isDestructive)
+    }
+
+    func testAdminActionResult_okFactory() {
+        let r = AdminActionResult.ok("All good")
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.message, "All good")
+    }
+
+    func testAdminActionResult_failedFactory() {
+        let r = AdminActionResult.failed("Nope")
+        XCTAssertFalse(r.success)
+        XCTAssertEqual(r.message, "Nope")
+    }
+
+    func testAdminActionResult_initDirectly() {
+        let r = AdminActionResult(success: true, message: "OK")
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.message, "OK")
+    }
+}
+
+// MARK: - CSRF guard
+
+final class CSRFGuardTests: XCTestCase {
+
+    func testRequireCSRF_missingHeader_throws() {
+        XCTAssertThrowsError(try requireCSRF(headers: HTTPHeaders(), port: 8990))
+    }
+
+    func testRequireCSRF_wrongValue_throws() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "true")
+        XCTAssertThrowsError(try requireCSRF(headers: h, port: 8990))
+    }
+
+    func testRequireCSRF_correctHeader_noOrigin_passes() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "1")
+        XCTAssertNoThrow(try requireCSRF(headers: h, port: 8990))
+    }
+
+    func testRequireCSRF_correctHeaderAndOrigin_passes() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "1")
+        h.add(name: "Origin", value: "http://127.0.0.1:8990")
+        XCTAssertNoThrow(try requireCSRF(headers: h, port: 8990))
+    }
+
+    func testRequireCSRF_wrongOrigin_throws() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "1")
+        h.add(name: "Origin", value: "http://evil.example.com")
+        XCTAssertThrowsError(try requireCSRF(headers: h, port: 8990))
+    }
+
+    func testRequireCSRF_localhostIsNotSameAs127_throws() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "1")
+        h.add(name: "Origin", value: "http://localhost:8990")
+        XCTAssertThrowsError(try requireCSRF(headers: h, port: 8990))
+    }
+
+    func testRequireCSRF_portMismatch_throws() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "1")
+        h.add(name: "Origin", value: "http://127.0.0.1:9999")
+        XCTAssertThrowsError(try requireCSRF(headers: h, port: 8990))
+    }
+}
+
+// MARK: - LogCapture clear
+
+final class LogCaptureClearTests: XCTestCase {
+
+    func testClear_returnsDroppedCount() async {
+        let cap = LogCapture()
+        await cap.capture("a")
+        await cap.capture("b")
+        await cap.capture("c")
+        let dropped = await cap.clear()
+        XCTAssertEqual(dropped, 3)
+    }
+
+    func testClear_emptyBuffer_returnsZero() async {
+        let cap = LogCapture()
+        let dropped = await cap.clear()
+        XCTAssertEqual(dropped, 0)
+    }
+
+    func testClear_bufferIsEmptyAfterClear() async {
+        let cap = LogCapture()
+        await cap.capture("x")
+        _ = await cap.clear()
+        let lines = await cap.recentLines(count: 100)
+        XCTAssertEqual(lines, [])
+    }
+
+    func testClear_afterClear_canCaptureAgain() async {
+        let cap = LogCapture()
+        await cap.capture("before")
+        _ = await cap.clear()
+        await cap.capture("after")
+        let lines = await cap.recentLines(count: 100)
+        XCTAssertEqual(lines, ["after"])
+    }
+
+    func testClear_totalCapturedIsZeroAfterClear() async {
+        let cap = LogCapture()
+        await cap.capture("a")
+        await cap.capture("b")
+        _ = await cap.clear()
+        let total = await cap.totalCaptured
+        XCTAssertEqual(total, 0)
+    }
+}
+
+// MARK: - AdminConsoleDelegate Phase 2 defaults
+
+private final class MinimalDelegate2: AdminConsoleDelegate {}
+
+final class AdminConsoleDelegatePhase2Tests: XCTestCase {
+
+    func testDefaultAvailableActions_isEmpty() async {
+        let d = MinimalDelegate2()
+        let actions = await d.availableActions()
+        XCTAssertTrue(actions.isEmpty)
+    }
+
+    func testDefaultExecuteAction_returnsFailed() async throws {
+        let d = MinimalDelegate2()
+        let result = try await d.executeAction("anything")
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.message.contains("anything"))
+    }
+
+    func testDefaultReloadTLS_doesNotThrow() async throws {
+        let d = MinimalDelegate2()
+        try await d.reloadTLSCertificates()
+    }
+}
+
+// MARK: - Built-in actions
+
+final class BuiltinActionsTests: XCTestCase {
+
+    func testBuiltinActions_noneWhenNoLogsNoDelegate() {
+        let actions = adminBuiltinActions(hasLogs: false, hasDelegate: false)
+        XCTAssertTrue(actions.isEmpty)
+    }
+
+    func testBuiltinActions_clearLogsWhenHasLogs() {
+        let actions = adminBuiltinActions(hasLogs: true, hasDelegate: false)
+        XCTAssertEqual(actions.count, 1)
+        XCTAssertEqual(actions[0].name, "clear-logs")
+        XCTAssertTrue(actions[0].isDestructive)
+    }
+
+    func testBuiltinActions_reloadTLSWhenHasDelegate() {
+        let actions = adminBuiltinActions(hasLogs: false, hasDelegate: true)
+        XCTAssertEqual(actions.count, 1)
+        XCTAssertEqual(actions[0].name, "reload-tls")
+        XCTAssertFalse(actions[0].isDestructive)
+    }
+
+    func testBuiltinActions_bothWhenBothPresent() {
+        let actions = adminBuiltinActions(hasLogs: true, hasDelegate: true)
+        XCTAssertEqual(actions.count, 2)
+        XCTAssertEqual(actions.map(\.name), ["clear-logs", "reload-tls"])
+    }
 }
