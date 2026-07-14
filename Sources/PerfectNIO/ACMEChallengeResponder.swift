@@ -65,7 +65,8 @@ public actor ACMEChallengeResponder {
 	}
 
 	/// True if any challenge tokens are currently registered.
-	public var hasPendingChallenges: Bool {
-		!pending.isEmpty
-	}
+	public var hasPendingChallenges: Bool { !pending.isEmpty }
+
+	/// The count of currently registered challenge tokens.
+	public var pendingCount: Int { pending.count }
 }

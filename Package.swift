@@ -10,6 +10,7 @@ let package = Package(
         .executable(name: "PerfectNIOExe", targets: ["PerfectNIOExe"]),
         .library(name: "PerfectNIO", targets: ["PerfectNIO"]),
         .library(name: "PerfectNIOCRUD", targets: ["PerfectNIOCRUD"]),
+        .library(name: "PerfectAdminConsole", targets: ["PerfectAdminConsole"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
@@ -53,6 +54,23 @@ let package = Package(
                 "PerfectNIO",
                 .product(name: "PerfectCRUD", package: "Perfect-CRUD"),
                 .product(name: "NIO", package: "swift-nio"),
+            ]
+        ),
+        .target(
+            name: "PerfectAdminConsole",
+            dependencies: [
+                "PerfectNIO",
+                .product(name: "NIO", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+            ]
+        ),
+        .testTarget(
+            name: "PerfectAdminConsoleTests",
+            dependencies: [
+                "PerfectAdminConsole",
+                "PerfectNIO",
+                .product(name: "NIO", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
             ]
         ),
         .testTarget(

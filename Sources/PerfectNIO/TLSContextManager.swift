@@ -51,4 +51,12 @@ public actor TLSContextManager {
 	func context(for hostname: String?) -> NIOSSLContext? {
 		hostname.flatMap { contexts[$0] } ?? defaultContext
 	}
+
+	/// All hostnames that have an explicitly registered cert, sorted.
+	public func registeredHostnames() -> [String] {
+		Array(contexts.keys).sorted()
+	}
+
+	/// True when a fallback cert is registered for unmatched hostnames.
+	public var hasDefaultContext: Bool { defaultContext != nil }
 }
