@@ -56,6 +56,16 @@ public protocol AdminConsoleDelegate: AnyObject, Sendable {
     /// Return an empty array (default) to suppress the actions panel.
     func availableActions() async -> [AdminAction]
 
+    // MARK: Phase 4 — TLS operations
+
+    /// Called when the operator requests a per-domain certificate reload.
+    ///
+    /// Implement to re-read PEM files for `hostname` and push the new context to
+    /// `TLSContextManager`. If you use `CertificateWatcher`, call `watcher.reload()`.
+    /// Default falls back to `reloadTLSCertificates()` (reload-all) so existing Phase 2
+    /// conformers get sensible behaviour without any code change.
+    func reloadTLSCertificate(for hostname: String) async throws
+
     // MARK: Phase 3 — datasource management
 
     /// All datasource connections to surface in the admin console.
@@ -89,6 +99,7 @@ public extension AdminConsoleDelegate {
         .failed("Unknown action: \(name)")
     }
     func reloadTLSCertificates() async throws {}
+    func reloadTLSCertificate(for hostname: String) async throws { try await reloadTLSCertificates() }
     func registeredDatasources() async -> [DatasourceInfo] { [] }
     func testDatasource(name: String) async throws -> DatasourceTestResult {
         .failed("No datasource named '\(name)' is registered")

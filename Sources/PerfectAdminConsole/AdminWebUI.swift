@@ -133,6 +133,7 @@ main{padding:20px;max-width:980px;margin:0 auto}
       <div class="card"><h2>ACME Challenges</h2><div id="acme-rows"><div class="row"><span class="rl">Loading…</span></div></div></div>
       <div class="card"><h2>Routes</h2><div id="routes-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
       <div class="card" id="datasource-card"><h2>Datasources</h2><div id="datasource-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
+      <div class="card"><h2>Metrics</h2><div id="metrics-rows"><div class="row"><span class="rl">Loading…</span></div></div></div>
     </div>
     <div class="card" id="log-card">
       <h2>Log Tail <span id="log-meta" style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)"></span></h2>
@@ -183,9 +184,10 @@ async function api(path) {
 
 async function refresh() {
   try {
-    const [status, tls, acme, logs, routes, datasources] = await Promise.all([
+    const [status, tls, acme, logs, routes, datasources, metrics] = await Promise.all([
       api('/api/status'), api('/api/tls'), api('/api/acme'),
       api('/api/logs?count=100'), api('/api/routes'), api('/api/datasources'),
+      api('/api/metrics'),
     ]);
     renderStatus(status);
     renderTLS(tls);
@@ -193,6 +195,7 @@ async function refresh() {
     renderLogs(logs);
     renderRoutes(routes);
     renderDatasources(datasources);
+    renderMetrics(metrics);
     if (status.additionalSections && status.additionalSections.length)
       renderDelegate(status.additionalSections);
     document.getElementById('refresh-badge').textContent =
@@ -222,8 +225,16 @@ function renderTLS(t) {
       '<div class="row"><span class="rl" style="color:var(--muted)">No TLS configured</span></div>';
     return;
   }
-  let h = t.domains.map(d => '<span class="tag">' + esc(d) + '</span>').join('');
-  if (t.hasDefault) h += '<span class="tag" style="opacity:.55">+ default</span>';
+  let h = t.domains.map(d => {
+    const safe = esc(d).replace(/'/g, "\\'");
+    return '<div class="row">' +
+      '<span class="rl" style="font-family:var(--mono);font-size:12px">' + esc(d) + '</span>' +
+      '<span class="rv" style="display:flex;gap:4px">' +
+      '<button class="mini-btn" onclick="tlsReload(\'' + safe + '\')">Reload</button>' +
+      '<button class="mini-btn" style="border-color:var(--err);color:var(--err)" onclick="tlsRemove(\'' + safe + '\')">Remove</button>' +
+      '</span></div>';
+  }).join('');
+  if (t.hasDefault) h += '<div class="row"><span class="rl">Default cert</span><span class="rv" style="color:var(--muted);font-size:12px">registered</span></div>';
   document.getElementById('tls-content').innerHTML = h || '<span style="color:var(--muted);font-size:13px">none</span>';
 }
 
@@ -249,6 +260,55 @@ function renderRoutes(r) {
   }
   document.getElementById('routes-content').innerHTML =
     r.routes.map(u => '<span class="tag">' + esc(u) + '</span>').join('');
+}
+
+// ---- Phase 4: metrics + TLS operations ----
+
+function renderMetrics(m) {
+  let h = '';
+  h += row('Total requests', m.totalRequests.toLocaleString());
+  h += row('Total errors', m.totalErrors.toLocaleString());
+  h += row('Active connections', m.activeConnections.toLocaleString());
+  const rate = m.totalRequests > 0
+    ? (m.errorRate * 100).toFixed(1) + '%'
+    : '—';
+  h += row('Error rate', rate);
+  const topRoutes = Object.entries(m.routeCounts || {})
+    .sort((a, b) => b[1] - a[1]).slice(0, 5);
+  if (topRoutes.length) {
+    h += '<div style="margin-top:8px;font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.04em">TOP ROUTES</div>';
+    for (const [route, count] of topRoutes)
+      h += row(route, count.toLocaleString());
+  }
+  document.getElementById('metrics-rows').innerHTML = h;
+}
+
+async function tlsReload(hostname) {
+  try {
+    const r = await fetch('/api/tls/reload', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'X-Admin-CSRF': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hostname })
+    });
+    if (r.status === 401) { logout(); return; }
+    const data = await r.json();
+    showToast(data.message, data.success ? 'ok' : 'err');
+  } catch(e) { showToast('Reload failed: ' + e.message, 'err'); }
+}
+
+async function tlsRemove(hostname) {
+  if (!confirm('Remove TLS config for ' + hostname + '?\nThe next connection for this domain will fall back to the default cert or be refused.')) return;
+  try {
+    const r = await fetch('/api/tls/domain', {
+      method: 'DELETE',
+      headers: { 'Authorization': 'Bearer ' + token, 'X-Admin-CSRF': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hostname })
+    });
+    if (r.status === 401) { logout(); return; }
+    const data = await r.json();
+    showToast(data.message, data.success ? 'ok' : 'err');
+    if (data.success) refresh();
+  } catch(e) { showToast('Remove failed: ' + e.message, 'err'); }
 }
 
 // ---- Phase 3: datasources ----

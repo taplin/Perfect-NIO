@@ -93,7 +93,10 @@ public final class CertificateWatcher: @unchecked Sendable {
 		source = src
 	}
 
-	private func reload() async throws {
+	/// Re-read PEM files from disk and push the new context to `TLSContextManager`.
+	/// Called automatically by the directory watcher; also callable programmatically
+	/// (e.g. from the admin console's per-domain TLS reload route).
+	public func reload() async throws {
 		let certPath = directory.appendingPathComponent("fullchain.pem").path
 		let keyPath  = directory.appendingPathComponent("privkey.pem").path
 		let certs = try NIOSSLCertificate.fromPEMFile(certPath)

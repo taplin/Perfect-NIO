@@ -592,3 +592,174 @@ final class AdminWebUIDatasourceTests: XCTestCase {
         XCTAssertTrue(html.contains("/api/datasources/test"), "datasource test endpoint missing from JS")
     }
 }
+
+// MARK: - Phase 4: AdminMetrics
+
+final class AdminMetricsTests: XCTestCase {
+
+    func testInitial_countersAreZero() async {
+        let m = AdminMetrics()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.totalRequests, 0)
+        XCTAssertEqual(snap.totalErrors, 0)
+        XCTAssertEqual(snap.activeConnections, 0)
+        XCTAssertTrue(snap.routeCounts.isEmpty)
+    }
+
+    func testRecordRequest_incrementsTotal() async {
+        let m = AdminMetrics()
+        await m.recordRequest(route: "GET:///api/status")
+        await m.recordRequest(route: "GET:///api/tls")
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.totalRequests, 2)
+    }
+
+    func testRecordRequest_tracksPerRoute() async {
+        let m = AdminMetrics()
+        await m.recordRequest(route: "GET:///api/status")
+        await m.recordRequest(route: "GET:///api/status")
+        await m.recordRequest(route: "GET:///api/tls")
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.routeCounts["GET:///api/status"], 2)
+        XCTAssertEqual(snap.routeCounts["GET:///api/tls"], 1)
+    }
+
+    func testRecordError_incrementsErrors() async {
+        let m = AdminMetrics()
+        await m.recordRequest(route: "POST:///api/broken")
+        await m.recordError()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.totalErrors, 1)
+    }
+
+    func testBeginConnection_incrementsActive() async {
+        let m = AdminMetrics()
+        await m.beginConnection()
+        await m.beginConnection()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.activeConnections, 2)
+    }
+
+    func testEndConnection_decrementsActive() async {
+        let m = AdminMetrics()
+        await m.beginConnection()
+        await m.beginConnection()
+        await m.endConnection()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.activeConnections, 1)
+    }
+
+    func testEndConnection_clampAtZero() async {
+        let m = AdminMetrics()
+        await m.endConnection()
+        await m.endConnection()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.activeConnections, 0)
+    }
+
+    func testSnapshotErrorRate_zeroWhenNoRequests() async {
+        let m = AdminMetrics()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.errorRate, 0.0)
+    }
+
+    func testSnapshotErrorRate_computed() async {
+        let m = AdminMetrics()
+        await m.recordRequest(route: "GET:///")
+        await m.recordRequest(route: "GET:///")
+        await m.recordError()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.errorRate, 0.5, accuracy: 0.001)
+    }
+}
+
+// MARK: - Phase 4: MetricsSnapshot
+
+final class MetricsSnapshotTests: XCTestCase {
+
+    func testInit_storesAllFields() {
+        let snap = MetricsSnapshot(totalRequests: 10, totalErrors: 2,
+                                   activeConnections: 3, routeCounts: ["GET:///": 7])
+        XCTAssertEqual(snap.totalRequests, 10)
+        XCTAssertEqual(snap.totalErrors, 2)
+        XCTAssertEqual(snap.activeConnections, 3)
+        XCTAssertEqual(snap.routeCounts["GET:///"], 7)
+    }
+
+    func testErrorRate_zeroRequests() {
+        let snap = MetricsSnapshot(totalRequests: 0, totalErrors: 0,
+                                   activeConnections: 0, routeCounts: [:])
+        XCTAssertEqual(snap.errorRate, 0.0)
+    }
+
+    func testErrorRate_withErrors() {
+        let snap = MetricsSnapshot(totalRequests: 4, totalErrors: 1,
+                                   activeConnections: 0, routeCounts: [:])
+        XCTAssertEqual(snap.errorRate, 0.25, accuracy: 0.001)
+    }
+
+    func testEncodable_includesAllKeys() throws {
+        let snap = MetricsSnapshot(totalRequests: 5, totalErrors: 1,
+                                   activeConnections: 2, routeCounts: ["GET:///": 5])
+        let data = try JSONEncoder().encode(snap)
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertNotNil(obj?["totalRequests"])
+        XCTAssertNotNil(obj?["totalErrors"])
+        XCTAssertNotNil(obj?["activeConnections"])
+        XCTAssertNotNil(obj?["routeCounts"])
+    }
+}
+
+// MARK: - Phase 4: AdminConsoleDelegate TLS defaults
+
+private final class MinimalDelegate4: AdminConsoleDelegate {}
+
+final class AdminConsoleDelegatePhase4Tests: XCTestCase {
+
+    func testDefaultReloadTLSCertificate_doesNotThrow() async throws {
+        let d = MinimalDelegate4()
+        // Default calls reloadTLSCertificates() which is itself a no-op default
+        try await d.reloadTLSCertificate(for: "example.com")
+    }
+}
+
+// MARK: - Phase 4: AdminWebUI metrics + TLS ops
+
+final class AdminWebUIPhase4Tests: XCTestCase {
+
+    private func loadHTML() async throws -> String {
+        let output = AdminWebUI.response(tokenFilePath: "/tmp/tok.token")
+        var body: [UInt8] = []
+        let alloc = ByteBufferAllocator()
+        var chunk = try await output.nextChunk(allocator: alloc)
+        while let buf = chunk {
+            body.append(contentsOf: buf.readableBytesView)
+            chunk = try await output.nextChunk(allocator: alloc)
+        }
+        return String(decoding: body, as: UTF8.self)
+    }
+
+    func testResponse_containsMetricsCard() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("metrics-rows"), "Metrics card missing from HTML")
+        XCTAssertTrue(html.contains("Metrics"), "Metrics heading missing")
+    }
+
+    func testResponse_containsRenderMetrics() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("renderMetrics"), "renderMetrics JS function missing")
+        XCTAssertTrue(html.contains("/api/metrics"), "metrics API endpoint missing from JS")
+    }
+
+    func testResponse_containsTLSReloadFunction() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("tlsReload"), "tlsReload JS function missing")
+        XCTAssertTrue(html.contains("/api/tls/reload"), "TLS reload endpoint missing from JS")
+    }
+
+    func testResponse_containsTLSRemoveFunction() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("tlsRemove"), "tlsRemove JS function missing")
+        XCTAssertTrue(html.contains("/api/tls/domain"), "TLS remove endpoint missing from JS")
+    }
+}
