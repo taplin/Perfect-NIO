@@ -45,6 +45,13 @@ public actor LogCapture {
         return Array(lines[start...])
     }
 
-    /// Total lines captured since this instance was created (including overwritten ones).
+    /// Removes all lines from the buffer. Returns the count of lines that were dropped.
+    public func clear() -> Int {
+        let dropped = lines.count
+        lines = []
+        return dropped
+    }
+
+    /// Total lines currently held in the buffer.
     public var totalCaptured: Int { lines.count }
 }

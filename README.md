@@ -23,6 +23,7 @@ A Swift 6 HTTP(S) server library built on SwiftNIO. Routes are a composable, str
 - [Custom HTTPOutput](#custom-httpoutput)
 - [WebSocket](#websocket)
 - [TLS / HTTPS](#tls--https)
+- [Admin console](#admin-console)
 - [Reference](#reference)
 - [Linux support](#linux-support)
 
@@ -450,6 +451,301 @@ let tls  = TLSConfiguration.makeServerConfiguration(
 )
 
 try await Server(routes: routes, port: 443, tls: tls).run()
+```
+
+---
+
+## Admin console
+
+`PerfectAdminConsole` is an optional SPM library target that starts a lightweight read/write admin server bound exclusively to `127.0.0.1`. It is never included unless the host application explicitly depends on it.
+
+### Package.swift
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/taplin/Perfect-NIO.git", branch: "main"),
+],
+targets: [
+    .target(
+        name: "MyServer",
+        dependencies: [
+            .product(name: "PerfectNIO", package: "Perfect-NIO"),
+            .product(name: "PerfectAdminConsole", package: "Perfect-NIO"),
+        ]
+    ),
+]
+```
+
+### Basic setup
+
+```swift
+import PerfectAdminConsole
+
+let logCapture = LogCapture()          // optional — omit if you don't need log tail
+let admin = try AdminConsole(
+    port: 8990,
+    tokenFilePath: "/var/run/myapp-admin.token",
+    tlsManager: certManager,           // optional — from PerfectNIO TLS setup
+    acmeResponder: acme,               // optional
+    logCapture: logCapture,
+    delegate: myServer                 // optional — see AdminConsoleDelegate below
+)
+async let _ = admin.run()             // binds 127.0.0.1:8990, prints token path to stderr
+```
+
+The token file is created at startup with `chmod 600`. Read it once to authenticate:
+
+```bash
+TOKEN=$(cat /var/run/myapp-admin.token)
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8990/api/status | jq
+```
+
+### Web dashboard
+
+`GET /` (no auth) serves a self-contained HTML/CSS/JS dashboard — no
+external resources, dark/light mode via `prefers-color-scheme`. Open
+`http://127.0.0.1:<port>` in a browser, paste the token from the file
+above into the field, and click **Connect**. The token is kept in
+`sessionStorage` for the tab's lifetime (cleared on tab close or on a 401
+— e.g. after a restart rotates the token), so you re-paste it after every
+process restart.
+
+Once connected, the dashboard polls every endpoint on a 5-second cycle
+(visible as "refresh in Ns" under the log card) and renders one card per
+concern:
+
+- **Server Status** — admin port, delegate's `serverPort`/uptime, TLS domain count, ACME pending-challenge count.
+- **TLS Domains** — registered hostnames with per-domain **Reload**/**Remove** buttons (only meaningful if a `tlsManager` was passed to `init`).
+- **ACME Challenges** — pending challenge count.
+- **Routes** — `registeredRoutes` from the delegate, as tags.
+- **Metrics** — total requests/errors, active connections, error rate, and the top 5 busiest routes (only populated if an `AdminMetrics` instance was passed to `init` and the host app calls `recordRequest`/`recordError`).
+- **Datasources** — a full-width, 3-column table (Datasource / Active Connection / Actions) — deliberately pulled out of the summary-card grid rather than squeezed into a narrow auto-fill cell, since a row's controls (a config-switcher `<select>` plus Switch/Test buttons) need real width to avoid clipping. Collapses to a single stacked column below 680px viewport width. Each row shows the delegate-reported `driver`/`schema`, the currently active `DatasourceConfigInfo` (if `availableConfigs(for:)` returns any), a **Test** button (always), and a config `<select>` + **Switch** button (only when more than one config is available for that datasource).
+- **Log Tail** — the most recent `LogCapture` lines, auto-scrolling if you were already scrolled to the bottom; a footer shows "showing N of M captured".
+- **Delegate sections** — one card per `AdminStatusSection` returned by `additionalStatusSections()`, rendered as simple label/value rows.
+- **Actions** — grouped by `category`, one card per category, one row per `AdminAction`. A `description` is plain text but can be **built fresh on every `availableActions()` call** to reflect live delegate state (e.g. "Running now — 340/1,989 items, started 2m ago" for a long-running action) — since the dashboard re-fetches `/api/actions` on every 5-second refresh (not just once at page load), a live-updating description shows up without a manual reload. Destructive actions (`isDestructive: true`) show a confirmation dialog before executing.
+
+If a request fails (network error, or a 500), the header's "updated
+HH:MM:SS" text is replaced with "error: ...". A 401 anywhere logs the
+session out and returns to the token-entry screen.
+
+### Phase 1 — read-only API
+
+All endpoints require `Authorization: Bearer <token>`.
+
+| Endpoint | Response |
+|---|---|
+| `GET /` | HTML dashboard (no auth — loads the token-entry form) |
+| `GET /api/status` | Server uptime, TLS domain count, ACME pending challenges, delegate sections |
+| `GET /api/tls` | `{domains: [String], hasDefault: Bool}` |
+| `GET /api/acme` | `{pendingChallenges: Int}` |
+| `GET /api/logs?count=N` | `{lines: [String], totalCaptured: Int}` — last N lines from `LogCapture` |
+| `GET /api/routes` | `{routes: [String]}` — from delegate |
+| `GET /api/actions` | `{actions: [...]}` — available actions (built-in + delegate) |
+
+### Phase 2 — actions and CSRF
+
+Mutating endpoints require `Authorization: Bearer <token>` **and** `X-Admin-CSRF: 1`. When an `Origin` header is present it must equal `http://127.0.0.1:<port>`.
+
+| Endpoint | Body | Effect |
+|---|---|---|
+| `GET /api/actions` | — | List built-in + delegate actions |
+| `POST /api/actions` | `{"action": "clear-logs"}` | Clear the log ring buffer |
+| `POST /api/actions` | `{"action": "reload-tls"}` | Ask delegate to reload all TLS certs |
+| `DELETE /api/logs` | — | Clear log ring buffer immediately |
+
+### Phase 3 — datasource management
+
+| Endpoint | Body | Response |
+|---|---|---|
+| `GET /api/datasources` | — | `{datasources: [{name, alias, schema, driver}]}` |
+| `POST /api/datasources/test` | `{"name": "mysql-main"}` | `{success, message, latencyMs?}` |
+
+```bash
+TOKEN=$(cat /var/run/myapp-admin.token)
+
+# List datasources
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8990/api/datasources | jq
+
+# Test a specific connection
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-CSRF: 1" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"mysql-main"}' \
+  http://127.0.0.1:8990/api/datasources/test | jq
+```
+
+### Phase 4 — TLS operations and metrics
+
+| Endpoint | Body | Effect |
+|---|---|---|
+| `GET /api/metrics` | — | `{totalRequests, totalErrors, activeConnections, routeCounts, errorRate}` |
+| `POST /api/tls/reload` | `{"hostname": "example.com"}` | Hot-reload cert via `delegate.reloadTLSCertificate(for:)` |
+| `DELETE /api/tls/domain` | `{"hostname": "example.com"}` | Remove hostname from live TLS map |
+
+```bash
+TOKEN=$(cat /var/run/myapp-admin.token)
+
+# Metrics snapshot
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8990/api/metrics | jq
+
+# Reload a specific domain's cert (after certbot renewed it)
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-CSRF: 1" \
+  -H "Content-Type: application/json" \
+  -d '{"hostname":"example.com"}' \
+  http://127.0.0.1:8990/api/tls/reload | jq
+
+# Remove a domain from the live TLS map
+curl -s -X DELETE \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-CSRF: 1" \
+  -H "Content-Type: application/json" \
+  -d '{"hostname":"old-tenant.example.com"}' \
+  http://127.0.0.1:8990/api/tls/domain | jq
+```
+
+### Phase 5 — live datasource config switching
+
+The config switcher lets operators change a datasource's active configuration at runtime without restarting the server. It is intentionally framework-agnostic: the `id` field in `DatasourceConfigInfo` is an opaque string your delegate maps to whatever switching mechanism you use.
+
+| Endpoint | Body | Effect |
+|---|---|---|
+| `GET /api/datasources` | — | Returns each datasource including its `configs[]` array |
+| `POST /api/datasources/switch` | `{"name": "mysql-main", "config": "staging"}` | Calls `delegate.switchDatasource(name:to:)` |
+
+```bash
+TOKEN=$(cat /var/run/myapp-admin.token)
+
+# Switch mysql-main to the staging config
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-CSRF: 1" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"mysql-main","config":"staging"}' \
+  http://127.0.0.1:8990/api/datasources/switch | jq
+# {"success":true,"message":"Switched to staging (appdb_staging)","latencyMs":12.4}
+```
+
+Typical `id` values by framework:
+- **Lasso** — path to an alternate `.conf` file (e.g. `/etc/lasso/datasources/staging.conf`)
+- **MySQL pool** — a named profile key (e.g. `"staging"`) that triggers a pool reconnect
+- **Custom API** — an env profile name (`"dev"`, `"staging"`, `"prod"`) or any stable key
+
+### AdminConsoleDelegate
+
+Implement this protocol (all methods have default implementations) to expose host-specific data and actions:
+
+```swift
+import PerfectAdminConsole
+
+actor MyServer: AdminConsoleDelegate {
+    // Phase 1 — status
+    var serverPort: Int { 9090 }
+    var serverStartTime: Date { startedAt }
+    var registeredRoutes: [RouteInfo] { routes.map { RouteInfo(uri: $0.key) } }
+    func additionalStatusSections() async -> [AdminStatusSection] {
+        [AdminStatusSection(title: "Database", items: [("pool", "\(pool.count)")])]
+    }
+
+    // Phase 2 — actions
+    func availableActions() async -> [AdminAction] {
+        [AdminAction(name: "flush-cache", label: "Flush Cache",
+                     description: "Evict all cached responses.", category: "maintenance")]
+    }
+    func executeAction(_ name: String) async throws -> AdminActionResult {
+        switch name {
+        case "flush-cache": cache.removeAll(); return .ok("Cache flushed")
+        default: return .failed("Unknown action: \(name)")
+        }
+    }
+    func reloadTLSCertificates() async throws {
+        try await certManager.setCertificate(for: "example.com", config: loadCert())
+    }
+
+    // Phase 3 — datasources
+    func registeredDatasources() async -> [DatasourceInfo] {
+        [DatasourceInfo(name: "mysql-main", alias: "MainDB", schema: "appdb", driver: "MySQL")]
+    }
+    func testDatasource(name: String) async throws -> DatasourceTestResult {
+        let start = Date()
+        do {
+            try await pool.ping()
+            return .ok(latencyMs: Date().timeIntervalSince(start) * 1000)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    // Phase 4 — TLS per-domain reload
+    func reloadTLSCertificate(for hostname: String) async throws {
+        guard let watcher = certWatchers[hostname] else {
+            throw AdminError.unknownHostname(hostname)
+        }
+        try await watcher.reload()
+    }
+
+    // Phase 5 — live config switching (Lasso example)
+    func availableConfigs(for datasource: String) async -> [DatasourceConfigInfo] {
+        guard datasource == "lasso-main" else { return [] }
+        return [
+            DatasourceConfigInfo(id: "/etc/lasso/ds/production.conf",
+                                 label: "Production", description: "mysql-prod / appdb",
+                                 isActive: currentConfig == "production"),
+            DatasourceConfigInfo(id: "/etc/lasso/ds/staging.conf",
+                                 label: "Staging", description: "mysql-stage / appdb_staging",
+                                 isActive: currentConfig == "staging"),
+        ]
+    }
+    func switchDatasource(name: String, to configID: String) async throws -> DatasourceTestResult {
+        let start = Date()
+        do {
+            try await lassoPool.reloadConfig(from: configID)
+            currentConfig = configID.contains("staging") ? "staging" : "production"
+            let ms = Date().timeIntervalSince(start) * 1000
+            return .ok(latencyMs: ms, message: "Switched to \(currentConfig)")
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+}
+```
+
+### AdminMetrics — request counters
+
+Pass an `AdminMetrics` instance to `AdminConsole.init` and feed it from your route handlers:
+
+```swift
+let metrics = AdminMetrics()
+let admin = try AdminConsole(port: 8990, tokenFilePath: tokenPath, metrics: metrics)
+
+// In each route handler:
+await metrics.recordRequest(route: "GET:///api/posts")
+
+// On error paths:
+await metrics.recordError()
+
+// Around TCP connections (optional):
+await metrics.beginConnection()
+defer { Task { await metrics.endConnection() } }
+```
+
+`GET /api/metrics` returns a snapshot with `totalRequests`, `totalErrors`, `activeConnections`, `routeCounts` (top routes by name), and a computed `errorRate`.
+
+### LogCapture — feeding log lines
+
+`LogCapture` is a Swift actor with a configurable ring buffer (default 500 lines). Integrate it with your logging stack:
+
+```swift
+let capture = LogCapture(capacity: 500)
+
+// Manual:
+await capture.capture("2026-07-14 10:00:00 [INFO] Server started")
+
+// With swift-log via MultiplexLogHandler + a custom LogHandler that calls capture.capture(_:)
 ```
 
 ---

@@ -8,10 +8,13 @@
 //===----------------------------------------------------------------------===//
 //
 // AdminConsoleDelegate — protocol for the host application to supply live
-// server state to the admin console's status and route displays.
+// server state to the admin console's status, route, and action displays.
 //
 // All methods have default no-op implementations: conformance is additive.
 // The host implements only what it wants to expose.
+//
+// Phase 1: status sections, route inspector
+// Phase 2: custom actions, TLS certificate reload
 
 import Foundation
 
@@ -36,6 +39,8 @@ public struct AdminStatusSection: Sendable {
 /// Protocol for the host application to supply live server state to the admin console.
 /// Conformers must be `Sendable`; actors satisfy this automatically.
 public protocol AdminConsoleDelegate: AnyObject, Sendable {
+    // MARK: Phase 1 — status display
+
     /// The port the main application server is listening on. Return 0 to omit.
     var serverPort: Int { get }
     /// When the server process started — used for uptime display.
@@ -44,6 +49,68 @@ public protocol AdminConsoleDelegate: AnyObject, Sendable {
     var registeredRoutes: [RouteInfo] { get }
     /// Optional extra sections shown below the standard status cards.
     func additionalStatusSections() async -> [AdminStatusSection]
+
+    // MARK: Phase 2 — actions
+
+    /// Custom actions offered by this host. Combined with built-in actions in the console.
+    /// Return an empty array (default) to suppress the actions panel.
+    func availableActions() async -> [AdminAction]
+
+    // MARK: Phase 4 — TLS operations
+
+    /// Called when the operator requests a per-domain certificate reload.
+    ///
+    /// Implement to re-read PEM files for `hostname` and push the new context to
+    /// `TLSContextManager`. If you use `CertificateWatcher`, call `watcher.reload()`.
+    /// Default falls back to `reloadTLSCertificates()` (reload-all) so existing Phase 2
+    /// conformers get sensible behaviour without any code change.
+    func reloadTLSCertificate(for hostname: String) async throws
+
+    // MARK: Phase 3 — datasource management
+
+    /// All datasource connections to surface in the admin console.
+    /// Return only sanitized info: alias + schema name, **never** credentials.
+    func registeredDatasources() async -> [DatasourceInfo]
+
+    /// Test a specific named datasource connection on demand.
+    ///
+    /// Only called for `name` values returned by `registeredDatasources()`.
+    /// Return `.failed("reason")` rather than throwing — that produces a clean
+    /// toast notification rather than a 500 error in the UI.
+    func testDatasource(name: String) async throws -> DatasourceTestResult
+
+    // MARK: Phase 5 — live datasource config switching
+
+    /// The named configurations available for a specific datasource.
+    ///
+    /// Return an empty array (default) to suppress the config switcher for that datasource.
+    /// Mark exactly one entry `isActive: true` to show the current selection in the UI.
+    ///
+    /// - Note: Config identity is opaque — `id` is whatever string your host uses to
+    ///   identify a configuration (file path, env profile name, pool key, etc.). The admin
+    ///   console passes it back verbatim to `switchDatasource(name:to:)`.
+    func availableConfigs(for datasource: String) async -> [DatasourceConfigInfo]
+
+    /// Switch a named datasource to a different configuration at runtime.
+    ///
+    /// Only called with `configID` values returned by `availableConfigs(for:)`.
+    /// Return a `DatasourceTestResult` — the framework shows it as a toast and logs it.
+    /// Return `.failed("reason")` rather than throwing so the UI gets a clean message.
+    ///
+    /// Typical implementations:
+    /// - Lasso: reload a different `.conf` file and reinitialise the datasource alias
+    /// - MySQL pool: drain the pool and reconnect with new credentials from a different profile
+    /// - Custom API: swap environment variables and reconnect
+    func switchDatasource(name: String, to configID: String) async throws -> DatasourceTestResult
+
+    /// Execute a custom action by name. Only called for names returned by `availableActions()`.
+    /// Return `.failed` rather than throwing to send a friendly error message to the UI.
+    func executeAction(_ name: String) async throws -> AdminActionResult
+
+    /// Called when the operator triggers the built-in "reload-tls" action.
+    /// Implement to re-read certificate PEM files and push them to your `TLSContextManager`.
+    /// Default implementation is a no-op (the built-in action will report success silently).
+    func reloadTLSCertificates() async throws
 }
 
 public extension AdminConsoleDelegate {
@@ -51,4 +118,18 @@ public extension AdminConsoleDelegate {
     var serverStartTime: Date { .distantFuture }
     var registeredRoutes: [RouteInfo] { [] }
     func additionalStatusSections() async -> [AdminStatusSection] { [] }
+    func availableActions() async -> [AdminAction] { [] }
+    func executeAction(_ name: String) async throws -> AdminActionResult {
+        .failed("Unknown action: \(name)")
+    }
+    func reloadTLSCertificates() async throws {}
+    func reloadTLSCertificate(for hostname: String) async throws { try await reloadTLSCertificates() }
+    func registeredDatasources() async -> [DatasourceInfo] { [] }
+    func testDatasource(name: String) async throws -> DatasourceTestResult {
+        .failed("No datasource named '\(name)' is registered")
+    }
+    func availableConfigs(for datasource: String) async -> [DatasourceConfigInfo] { [] }
+    func switchDatasource(name: String, to configID: String) async throws -> DatasourceTestResult {
+        .failed("Config switching not supported for '\(name)'")
+    }
 }

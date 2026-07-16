@@ -92,6 +92,34 @@ main{padding:20px;max-width:980px;margin:0 auto}
 .log-footer{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:8px}
 /* ---- delegate sections ---- */
 #delegate-cards{margin-top:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+/* ---- mini buttons (datasource test, tls ops) ---- */
+.mini-btn{padding:3px 9px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);cursor:pointer;font-size:11px;font-weight:600;white-space:nowrap}
+.mini-btn:hover{background:var(--accent);color:#fff}
+/* ---- config switcher ---- */
+.cfg-select{padding:3px 6px;border:1px solid var(--border);border-radius:5px;background:var(--card);color:var(--text);font-size:11px;cursor:pointer;max-width:220px}
+/* ---- datasource table (full-width, 3-column, nothing clipped) ---- */
+#datasource-card{margin-bottom:14px}
+.ds-table{display:grid;grid-template-columns:minmax(180px,1.3fr) minmax(220px,1.6fr) minmax(170px,auto);gap:8px 20px;align-items:start}
+.ds-head{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.ds-divider{grid-column:1/-1;height:1px;background:var(--border)}
+.ds-cell{min-width:0;padding:2px 0}
+.ds-controls{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.ds-name{font-weight:600}
+.ds-sub{color:var(--muted);font-size:12px;margin-top:2px}
+.ds-active{color:var(--ok);font-size:12px}
+@media(max-width:680px){.ds-table{grid-template-columns:1fr}.ds-head{display:none}}
+/* ---- actions section ---- */
+#actions-section{margin-top:14px}
+.action-btn{padding:5px 12px;border:1px solid var(--accent);border-radius:6px;background:transparent;color:var(--accent);cursor:pointer;font-size:12px;font-weight:600;transition:background .15s,color .15s}
+.action-btn:hover{background:var(--accent);color:#fff}
+.action-btn.destructive{border-color:var(--err);color:var(--err)}
+.action-btn.destructive:hover{background:var(--err);color:#fff}
+/* ---- toasts ---- */
+#toast-container{position:fixed;bottom:20px;right:20px;display:flex;flex-direction:column;gap:8px;z-index:100;pointer-events:none}
+.toast{padding:10px 16px;border-radius:8px;font-size:13px;background:var(--card);border:1px solid var(--border);box-shadow:0 2px 8px rgba(0,0,0,.18);max-width:320px;transition:opacity .4s;pointer-events:auto}
+.toast-ok{border-left:3px solid var(--ok)}
+.toast-err{border-left:3px solid var(--err)}
+.toast-fade{opacity:0}
 </style>
 </head>
 <body>
@@ -117,7 +145,9 @@ main{padding:20px;max-width:980px;margin:0 auto}
       <div class="card"><h2>TLS Domains</h2><div id="tls-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
       <div class="card"><h2>ACME Challenges</h2><div id="acme-rows"><div class="row"><span class="rl">Loading…</span></div></div></div>
       <div class="card"><h2>Routes</h2><div id="routes-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
+      <div class="card"><h2>Metrics</h2><div id="metrics-rows"><div class="row"><span class="rl">Loading…</span></div></div></div>
     </div>
+    <div class="card" id="datasource-card"><h2>Datasources</h2><div id="datasource-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
     <div class="card" id="log-card">
       <h2>Log Tail <span id="log-meta" style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)"></span></h2>
       <div class="log-box" id="log-box">Loading…</div>
@@ -127,8 +157,10 @@ main{padding:20px;max-width:980px;margin:0 auto}
       </div>
     </div>
     <div id="delegate-cards"></div>
+    <div id="actions-section"></div>
   </main>
 </div>
+<div id="toast-container"></div>
 
 <script>
 'use strict';
@@ -165,15 +197,22 @@ async function api(path) {
 
 async function refresh() {
   try {
-    const [status, tls, acme, logs, routes] = await Promise.all([
+    const [status, tls, acme, logs, routes, datasources, metrics, actions] = await Promise.all([
       api('/api/status'), api('/api/tls'), api('/api/acme'),
-      api('/api/logs?count=100'), api('/api/routes'),
+      api('/api/logs?count=100'), api('/api/routes'), api('/api/datasources'),
+      api('/api/metrics'), api('/api/actions'),
     ]);
     renderStatus(status);
     renderTLS(tls);
     renderACME(acme);
     renderLogs(logs);
     renderRoutes(routes);
+    renderDatasources(datasources);
+    renderMetrics(metrics);
+    // Re-rendered every cycle (not just on first load) so an action whose
+    // description reflects live state — e.g. a crawl-report delegate
+    // showing "Running now — 340/1,989 pages" — updates without a reload.
+    renderActions(actions.actions || []);
     if (status.additionalSections && status.additionalSections.length)
       renderDelegate(status.additionalSections);
     document.getElementById('refresh-badge').textContent =
@@ -203,8 +242,16 @@ function renderTLS(t) {
       '<div class="row"><span class="rl" style="color:var(--muted)">No TLS configured</span></div>';
     return;
   }
-  let h = t.domains.map(d => '<span class="tag">' + esc(d) + '</span>').join('');
-  if (t.hasDefault) h += '<span class="tag" style="opacity:.55">+ default</span>';
+  let h = t.domains.map(d => {
+    const safe = esc(d).replace(/'/g, "\\'");
+    return '<div class="row">' +
+      '<span class="rl" style="font-family:var(--mono);font-size:12px">' + esc(d) + '</span>' +
+      '<span class="rv" style="display:flex;gap:4px">' +
+      '<button class="mini-btn" onclick="tlsReload(\'' + safe + '\')">Reload</button>' +
+      '<button class="mini-btn" style="border-color:var(--err);color:var(--err)" onclick="tlsRemove(\'' + safe + '\')">Remove</button>' +
+      '</span></div>';
+  }).join('');
+  if (t.hasDefault) h += '<div class="row"><span class="rl">Default cert</span><span class="rv" style="color:var(--muted);font-size:12px">registered</span></div>';
   document.getElementById('tls-content').innerHTML = h || '<span style="color:var(--muted);font-size:13px">none</span>';
 }
 
@@ -232,12 +279,198 @@ function renderRoutes(r) {
     r.routes.map(u => '<span class="tag">' + esc(u) + '</span>').join('');
 }
 
+// ---- Phase 4: metrics + TLS operations ----
+
+function renderMetrics(m) {
+  let h = '';
+  h += row('Total requests', m.totalRequests.toLocaleString());
+  h += row('Total errors', m.totalErrors.toLocaleString());
+  h += row('Active connections', m.activeConnections.toLocaleString());
+  const rate = m.totalRequests > 0
+    ? (m.errorRate * 100).toFixed(1) + '%'
+    : '—';
+  h += row('Error rate', rate);
+  const topRoutes = Object.entries(m.routeCounts || {})
+    .sort((a, b) => b[1] - a[1]).slice(0, 5);
+  if (topRoutes.length) {
+    h += '<div style="margin-top:8px;font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.04em">TOP ROUTES</div>';
+    for (const [route, count] of topRoutes)
+      h += row(route, count.toLocaleString());
+  }
+  document.getElementById('metrics-rows').innerHTML = h;
+}
+
+async function tlsReload(hostname) {
+  try {
+    const r = await fetch('/api/tls/reload', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'X-Admin-CSRF': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hostname })
+    });
+    if (r.status === 401) { logout(); return; }
+    const data = await r.json();
+    showToast(data.message, data.success ? 'ok' : 'err');
+  } catch(e) { showToast('Reload failed: ' + e.message, 'err'); }
+}
+
+async function tlsRemove(hostname) {
+  if (!confirm('Remove TLS config for ' + hostname + '?\nThe next connection for this domain will fall back to the default cert or be refused.')) return;
+  try {
+    const r = await fetch('/api/tls/domain', {
+      method: 'DELETE',
+      headers: { 'Authorization': 'Bearer ' + token, 'X-Admin-CSRF': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hostname })
+    });
+    if (r.status === 401) { logout(); return; }
+    const data = await r.json();
+    showToast(data.message, data.success ? 'ok' : 'err');
+    if (data.success) refresh();
+  } catch(e) { showToast('Remove failed: ' + e.message, 'err'); }
+}
+
+// ---- Phase 3: datasources ----
+
+function renderDatasources(d) {
+  const el = document.getElementById('datasource-content');
+  if (!d.datasources || !d.datasources.length) {
+    el.innerHTML = '<div class="row"><span class="rl" style="color:var(--muted)">No datasources registered</span></div>';
+    return;
+  }
+  let h = '<div class="ds-table">';
+  h += '<div class="ds-head">Datasource</div><div class="ds-head">Active Connection</div><div class="ds-head">Actions</div>';
+  h += '<div class="ds-divider"></div>';
+  h += d.datasources.map(ds => {
+    const safeName = esc(ds.name).replace(/'/g, "\\'");
+    const active = (ds.configs || []).find(c => c.isActive);
+    const activeHTML = active
+      ? '<div class="ds-active">● ' + esc(active.label) + '</div>' +
+        (active.description ? '<div class="ds-sub">' + esc(active.description) + '</div>' : '')
+      : '<div class="ds-sub">—</div>';
+    // Config switcher: only shown when >1 config is available
+    const configs = ds.configs || [];
+    let controls = '';
+    if (configs.length > 1) {
+      const selId = 'cfg-' + ds.name.replace(/[^a-z0-9]/gi, '-');
+      const opts = configs.map(c =>
+        '<option value="' + esc(c.id) + '"' + (c.isActive ? ' selected' : '') + '>' + esc(c.label) + '</option>'
+      ).join('');
+      controls += '<select id="' + selId + '" class="cfg-select">' + opts + '</select>';
+      controls += '<button class="mini-btn" onclick="switchDS(\'' + safeName + '\',document.getElementById(\'' + selId + '\').value)">Switch</button>';
+    }
+    controls += '<button class="mini-btn" onclick="testDS(\'' + safeName + '\')">Test</button>';
+    return '<div class="ds-cell"><div class="ds-name">' + esc(ds.alias || ds.name) + '</div>' +
+      '<div class="ds-sub">' + esc(ds.driver) + ' · ' + esc(ds.schema) + '</div></div>' +
+      '<div class="ds-cell">' + activeHTML + '</div>' +
+      '<div class="ds-cell ds-controls">' + controls + '</div>' +
+      '<div class="ds-divider"></div>';
+  }).join('');
+  h += '</div>';
+  el.innerHTML = h;
+}
+
+async function switchDS(name, configID) {
+  if (!configID) return;
+  try {
+    const r = await fetch('/api/datasources/switch', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'X-Admin-CSRF': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, config: configID })
+    });
+    if (r.status === 401) { logout(); return; }
+    const data = await r.json();
+    const latency = data.latencyMs != null ? ' (' + Math.round(data.latencyMs) + 'ms)' : '';
+    showToast(name + ': ' + data.message + latency, data.success ? 'ok' : 'err');
+    // Refresh datasource card so the active config label updates
+    if (data.success) api('/api/datasources').then(renderDatasources).catch(() => {});
+  } catch(e) {
+    showToast('Switch failed: ' + e.message, 'err');
+  }
+}
+
+async function testDS(name) {
+  try {
+    const r = await fetch('/api/datasources/test', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'X-Admin-CSRF': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    if (r.status === 401) { logout(); return; }
+    const data = await r.json();
+    const latency = data.latencyMs != null ? ' (' + Math.round(data.latencyMs) + 'ms)' : '';
+    showToast(name + ': ' + data.message + latency, data.success ? 'ok' : 'err');
+  } catch(e) {
+    showToast('Test failed: ' + e.message, 'err');
+  }
+}
+
 function renderDelegate(sections) {
   const el = document.getElementById('delegate-cards');
   el.innerHTML = sections.map(s => {
     const rows = Object.entries(s.items).map(([k,v]) => row(k, v)).join('');
     return '<div class="card"><h2>' + esc(s.title) + '</h2>' + rows + '</div>';
   }).join('');
+}
+
+// ---- Phase 2: actions ----
+// Fetched as part of refresh()'s Promise.all so the actions section (and
+// any live status a delegate bakes into an action's description) updates
+// on every periodic tick, not just once at page load.
+
+function renderActions(actions) {
+  const el = document.getElementById('actions-section');
+  if (!actions.length) { el.innerHTML = ''; return; }
+  // Group by category
+  const cats = {};
+  for (const a of actions) {
+    const c = a.category || 'general';
+    (cats[c] = cats[c] || []).push(a);
+  }
+  let h = '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px">Actions</div>';
+  h += '<div class="grid">';
+  for (const [cat, acts] of Object.entries(cats)) {
+    h += '<div class="card"><h2>' + esc(cat) + '</h2>';
+    for (const a of acts) {
+      h += '<div class="row" style="flex-direction:column;align-items:flex-start;gap:4px;padding:10px 0">';
+      h += '<div style="display:flex;justify-content:space-between;width:100%;align-items:center;gap:8px">';
+      h += '<strong style="font-size:13px">' + esc(a.label) + '</strong>';
+      const cls = 'action-btn' + (a.isDestructive ? ' destructive' : '');
+      const escaped = esc(a.name).replace(/'/g, "\\'");
+      h += '<button class="' + cls + '" onclick="runAction(\'' + escaped + '\',' + (a.isDestructive ? 'true' : 'false') + ')">';
+      h += a.isDestructive ? 'Run (!)' : 'Run';
+      h += '</button></div>';
+      if (a.description) h += '<span style="color:var(--muted);font-size:12px">' + esc(a.description) + '</span>';
+      h += '</div>';
+    }
+    h += '</div>';
+  }
+  h += '</div>';
+  el.innerHTML = h;
+}
+
+async function runAction(name, isDestructive) {
+  if (isDestructive && !confirm('This action is destructive. Proceed?')) return;
+  try {
+    const r = await fetch('/api/actions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'X-Admin-CSRF': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: name })
+    });
+    if (r.status === 401) { logout(); return; }
+    const result = await r.json();
+    showToast(result.message, result.success ? 'ok' : 'err');
+    // Immediately refresh the log view if we just cleared it
+    if (name === 'clear-logs') api('/api/logs?count=100').then(renderLogs).catch(() => {});
+  } catch(e) {
+    showToast('Action failed: ' + e.message, 'err');
+  }
+}
+
+function showToast(msg, type) {
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + (type || 'ok');
+  t.textContent = msg;
+  document.getElementById('toast-container').appendChild(t);
+  setTimeout(() => { t.classList.add('toast-fade'); setTimeout(() => t.remove(), 400); }, 3500);
 }
 
 async function connect() {

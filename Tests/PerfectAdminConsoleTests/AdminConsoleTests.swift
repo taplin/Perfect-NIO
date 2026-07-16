@@ -255,4 +255,608 @@ final class AdminWebUITests: XCTestCase {
         let cc = head?.headers.first(name: "Cache-Control") ?? ""
         XCTAssertEqual(cc, "no-store")
     }
+
+    func testResponse_containsActionsSection() async throws {
+        let output = AdminWebUI.response(tokenFilePath: "/tmp/tok.token")
+        var body: [UInt8] = []
+        let alloc = ByteBufferAllocator()
+        var chunk = try await output.nextChunk(allocator: alloc)
+        while let buf = chunk {
+            body.append(contentsOf: buf.readableBytesView)
+            chunk = try await output.nextChunk(allocator: alloc)
+        }
+        let html = String(decoding: body, as: UTF8.self)
+        XCTAssertTrue(html.contains("actions-section"), "Phase 2 actions section missing from HTML")
+        XCTAssertTrue(html.contains("toast-container"), "Phase 2 toast container missing from HTML")
+    }
+}
+
+// MARK: - AdminAction / AdminActionResult
+
+final class AdminActionTests: XCTestCase {
+
+    func testAdminAction_storesAllFields() {
+        let a = AdminAction(name: "my-action", label: "My Action",
+                            description: "Does something", category: "ops", isDestructive: true)
+        XCTAssertEqual(a.name, "my-action")
+        XCTAssertEqual(a.label, "My Action")
+        XCTAssertEqual(a.description, "Does something")
+        XCTAssertEqual(a.category, "ops")
+        XCTAssertTrue(a.isDestructive)
+    }
+
+    func testAdminAction_defaultCategoryIsGeneral() {
+        let a = AdminAction(name: "x", label: "X", description: "")
+        XCTAssertEqual(a.category, "general")
+    }
+
+    func testAdminAction_defaultNonDestructive() {
+        let a = AdminAction(name: "x", label: "X", description: "")
+        XCTAssertFalse(a.isDestructive)
+    }
+
+    func testAdminActionResult_okFactory() {
+        let r = AdminActionResult.ok("All good")
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.message, "All good")
+    }
+
+    func testAdminActionResult_failedFactory() {
+        let r = AdminActionResult.failed("Nope")
+        XCTAssertFalse(r.success)
+        XCTAssertEqual(r.message, "Nope")
+    }
+
+    func testAdminActionResult_initDirectly() {
+        let r = AdminActionResult(success: true, message: "OK")
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.message, "OK")
+    }
+}
+
+// MARK: - CSRF guard
+
+final class CSRFGuardTests: XCTestCase {
+
+    func testRequireCSRF_missingHeader_throws() {
+        XCTAssertThrowsError(try requireCSRF(headers: HTTPHeaders(), port: 8990))
+    }
+
+    func testRequireCSRF_wrongValue_throws() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "true")
+        XCTAssertThrowsError(try requireCSRF(headers: h, port: 8990))
+    }
+
+    func testRequireCSRF_correctHeader_noOrigin_passes() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "1")
+        XCTAssertNoThrow(try requireCSRF(headers: h, port: 8990))
+    }
+
+    func testRequireCSRF_correctHeaderAndOrigin_passes() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "1")
+        h.add(name: "Origin", value: "http://127.0.0.1:8990")
+        XCTAssertNoThrow(try requireCSRF(headers: h, port: 8990))
+    }
+
+    func testRequireCSRF_wrongOrigin_throws() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "1")
+        h.add(name: "Origin", value: "http://evil.example.com")
+        XCTAssertThrowsError(try requireCSRF(headers: h, port: 8990))
+    }
+
+    func testRequireCSRF_localhostIsNotSameAs127_throws() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "1")
+        h.add(name: "Origin", value: "http://localhost:8990")
+        XCTAssertThrowsError(try requireCSRF(headers: h, port: 8990))
+    }
+
+    func testRequireCSRF_portMismatch_throws() {
+        var h = HTTPHeaders()
+        h.add(name: "X-Admin-CSRF", value: "1")
+        h.add(name: "Origin", value: "http://127.0.0.1:9999")
+        XCTAssertThrowsError(try requireCSRF(headers: h, port: 8990))
+    }
+}
+
+// MARK: - LogCapture clear
+
+final class LogCaptureClearTests: XCTestCase {
+
+    func testClear_returnsDroppedCount() async {
+        let cap = LogCapture()
+        await cap.capture("a")
+        await cap.capture("b")
+        await cap.capture("c")
+        let dropped = await cap.clear()
+        XCTAssertEqual(dropped, 3)
+    }
+
+    func testClear_emptyBuffer_returnsZero() async {
+        let cap = LogCapture()
+        let dropped = await cap.clear()
+        XCTAssertEqual(dropped, 0)
+    }
+
+    func testClear_bufferIsEmptyAfterClear() async {
+        let cap = LogCapture()
+        await cap.capture("x")
+        _ = await cap.clear()
+        let lines = await cap.recentLines(count: 100)
+        XCTAssertEqual(lines, [])
+    }
+
+    func testClear_afterClear_canCaptureAgain() async {
+        let cap = LogCapture()
+        await cap.capture("before")
+        _ = await cap.clear()
+        await cap.capture("after")
+        let lines = await cap.recentLines(count: 100)
+        XCTAssertEqual(lines, ["after"])
+    }
+
+    func testClear_totalCapturedIsZeroAfterClear() async {
+        let cap = LogCapture()
+        await cap.capture("a")
+        await cap.capture("b")
+        _ = await cap.clear()
+        let total = await cap.totalCaptured
+        XCTAssertEqual(total, 0)
+    }
+}
+
+// MARK: - AdminConsoleDelegate Phase 2 defaults
+
+private final class MinimalDelegate2: AdminConsoleDelegate {}
+
+final class AdminConsoleDelegatePhase2Tests: XCTestCase {
+
+    func testDefaultAvailableActions_isEmpty() async {
+        let d = MinimalDelegate2()
+        let actions = await d.availableActions()
+        XCTAssertTrue(actions.isEmpty)
+    }
+
+    func testDefaultExecuteAction_returnsFailed() async throws {
+        let d = MinimalDelegate2()
+        let result = try await d.executeAction("anything")
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.message.contains("anything"))
+    }
+
+    func testDefaultReloadTLS_doesNotThrow() async throws {
+        let d = MinimalDelegate2()
+        try await d.reloadTLSCertificates()
+    }
+}
+
+// MARK: - Built-in actions
+
+final class BuiltinActionsTests: XCTestCase {
+
+    func testBuiltinActions_noneWhenNoLogsNoDelegate() {
+        let actions = adminBuiltinActions(hasLogs: false, hasDelegate: false)
+        XCTAssertTrue(actions.isEmpty)
+    }
+
+    func testBuiltinActions_clearLogsWhenHasLogs() {
+        let actions = adminBuiltinActions(hasLogs: true, hasDelegate: false)
+        XCTAssertEqual(actions.count, 1)
+        XCTAssertEqual(actions[0].name, "clear-logs")
+        XCTAssertTrue(actions[0].isDestructive)
+    }
+
+    func testBuiltinActions_reloadTLSWhenHasDelegate() {
+        let actions = adminBuiltinActions(hasLogs: false, hasDelegate: true)
+        XCTAssertEqual(actions.count, 1)
+        XCTAssertEqual(actions[0].name, "reload-tls")
+        XCTAssertFalse(actions[0].isDestructive)
+    }
+
+    func testBuiltinActions_bothWhenBothPresent() {
+        let actions = adminBuiltinActions(hasLogs: true, hasDelegate: true)
+        XCTAssertEqual(actions.count, 2)
+        XCTAssertEqual(actions.map(\.name), ["clear-logs", "reload-tls"])
+    }
+}
+
+// MARK: - Phase 3: DatasourceInfo
+
+final class DatasourceInfoTests: XCTestCase {
+
+    func testInit_storesAllFields() {
+        let ds = DatasourceInfo(name: "mysql-main", alias: "MainDB", schema: "appdb", driver: "MySQL")
+        XCTAssertEqual(ds.name, "mysql-main")
+        XCTAssertEqual(ds.alias, "MainDB")
+        XCTAssertEqual(ds.schema, "appdb")
+        XCTAssertEqual(ds.driver, "MySQL")
+    }
+
+    func testInit_emptyStringsAllowed() {
+        let ds = DatasourceInfo(name: "", alias: "", schema: "", driver: "")
+        XCTAssertEqual(ds.name, "")
+    }
+
+    func testSendable_usableAcrossActors() async {
+        let ds = DatasourceInfo(name: "pg", alias: "Postgres", schema: "public", driver: "PostgreSQL")
+        let name = await Task.detached { ds.name }.value
+        XCTAssertEqual(name, "pg")
+    }
+}
+
+// MARK: - Phase 3: DatasourceTestResult
+
+final class DatasourceTestResultTests: XCTestCase {
+
+    func testOk_defaultMessage() {
+        let r = DatasourceTestResult.ok()
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.message, "Connection OK")
+        XCTAssertNil(r.latencyMs)
+    }
+
+    func testOk_withLatency() {
+        let r = DatasourceTestResult.ok(latencyMs: 3.7)
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.latencyMs, 3.7)
+    }
+
+    func testOk_withCustomMessage() {
+        let r = DatasourceTestResult.ok(message: "MySQL 9.6 · 2ms")
+        XCTAssertEqual(r.message, "MySQL 9.6 · 2ms")
+    }
+
+    func testFailed_successIsFalse() {
+        let r = DatasourceTestResult.failed("Connection refused")
+        XCTAssertFalse(r.success)
+        XCTAssertEqual(r.message, "Connection refused")
+    }
+
+    func testFailed_latencyIsNil() {
+        let r = DatasourceTestResult.failed("Timeout")
+        XCTAssertNil(r.latencyMs)
+    }
+
+    func testDirectInit_allFields() {
+        let r = DatasourceTestResult(success: true, message: "OK", latencyMs: 12.5)
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.message, "OK")
+        XCTAssertEqual(r.latencyMs, 12.5)
+    }
+
+    func testDirectInit_latencyDefaultsToNil() {
+        let r = DatasourceTestResult(success: false, message: "err")
+        XCTAssertNil(r.latencyMs)
+    }
+}
+
+// MARK: - Phase 3: AdminConsoleDelegate defaults
+
+private final class MinimalDelegate3: AdminConsoleDelegate {}
+
+final class AdminConsoleDelegatePhase3Tests: XCTestCase {
+
+    func testDefaultRegisteredDatasources_isEmpty() async {
+        let d = MinimalDelegate3()
+        let sources = await d.registeredDatasources()
+        XCTAssertTrue(sources.isEmpty)
+    }
+
+    func testDefaultTestDatasource_returnsFailed() async throws {
+        let d = MinimalDelegate3()
+        let result = try await d.testDatasource(name: "any-ds")
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.message.contains("any-ds"))
+    }
+
+    func testDefaultTestDatasource_latencyIsNil() async throws {
+        let d = MinimalDelegate3()
+        let result = try await d.testDatasource(name: "x")
+        XCTAssertNil(result.latencyMs)
+    }
+}
+
+// MARK: - Phase 3: AdminWebUI datasource section
+
+final class AdminWebUIDatasourceTests: XCTestCase {
+
+    func testResponse_containsDatasourceCard() async throws {
+        let output = AdminWebUI.response(tokenFilePath: "/tmp/tok.token")
+        var body: [UInt8] = []
+        let alloc = ByteBufferAllocator()
+        var chunk = try await output.nextChunk(allocator: alloc)
+        while let buf = chunk {
+            body.append(contentsOf: buf.readableBytesView)
+            chunk = try await output.nextChunk(allocator: alloc)
+        }
+        let html = String(decoding: body, as: UTF8.self)
+        XCTAssertTrue(html.contains("datasource-content"), "Datasource card container missing")
+        XCTAssertTrue(html.contains("Datasources"), "Datasource card heading missing")
+    }
+
+    func testResponse_containsDatasourceTestFunction() async throws {
+        let output = AdminWebUI.response(tokenFilePath: "/tmp/tok.token")
+        var body: [UInt8] = []
+        let alloc = ByteBufferAllocator()
+        var chunk = try await output.nextChunk(allocator: alloc)
+        while let buf = chunk {
+            body.append(contentsOf: buf.readableBytesView)
+            chunk = try await output.nextChunk(allocator: alloc)
+        }
+        let html = String(decoding: body, as: UTF8.self)
+        XCTAssertTrue(html.contains("testDS"), "testDS JS function missing")
+        XCTAssertTrue(html.contains("/api/datasources/test"), "datasource test endpoint missing from JS")
+    }
+}
+
+// MARK: - Phase 4: AdminMetrics
+
+final class AdminMetricsTests: XCTestCase {
+
+    func testInitial_countersAreZero() async {
+        let m = AdminMetrics()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.totalRequests, 0)
+        XCTAssertEqual(snap.totalErrors, 0)
+        XCTAssertEqual(snap.activeConnections, 0)
+        XCTAssertTrue(snap.routeCounts.isEmpty)
+    }
+
+    func testRecordRequest_incrementsTotal() async {
+        let m = AdminMetrics()
+        await m.recordRequest(route: "GET:///api/status")
+        await m.recordRequest(route: "GET:///api/tls")
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.totalRequests, 2)
+    }
+
+    func testRecordRequest_tracksPerRoute() async {
+        let m = AdminMetrics()
+        await m.recordRequest(route: "GET:///api/status")
+        await m.recordRequest(route: "GET:///api/status")
+        await m.recordRequest(route: "GET:///api/tls")
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.routeCounts["GET:///api/status"], 2)
+        XCTAssertEqual(snap.routeCounts["GET:///api/tls"], 1)
+    }
+
+    func testRecordError_incrementsErrors() async {
+        let m = AdminMetrics()
+        await m.recordRequest(route: "POST:///api/broken")
+        await m.recordError()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.totalErrors, 1)
+    }
+
+    func testBeginConnection_incrementsActive() async {
+        let m = AdminMetrics()
+        await m.beginConnection()
+        await m.beginConnection()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.activeConnections, 2)
+    }
+
+    func testEndConnection_decrementsActive() async {
+        let m = AdminMetrics()
+        await m.beginConnection()
+        await m.beginConnection()
+        await m.endConnection()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.activeConnections, 1)
+    }
+
+    func testEndConnection_clampAtZero() async {
+        let m = AdminMetrics()
+        await m.endConnection()
+        await m.endConnection()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.activeConnections, 0)
+    }
+
+    func testSnapshotErrorRate_zeroWhenNoRequests() async {
+        let m = AdminMetrics()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.errorRate, 0.0)
+    }
+
+    func testSnapshotErrorRate_computed() async {
+        let m = AdminMetrics()
+        await m.recordRequest(route: "GET:///")
+        await m.recordRequest(route: "GET:///")
+        await m.recordError()
+        let snap = await m.snapshot()
+        XCTAssertEqual(snap.errorRate, 0.5, accuracy: 0.001)
+    }
+}
+
+// MARK: - Phase 4: MetricsSnapshot
+
+final class MetricsSnapshotTests: XCTestCase {
+
+    func testInit_storesAllFields() {
+        let snap = MetricsSnapshot(totalRequests: 10, totalErrors: 2,
+                                   activeConnections: 3, routeCounts: ["GET:///": 7])
+        XCTAssertEqual(snap.totalRequests, 10)
+        XCTAssertEqual(snap.totalErrors, 2)
+        XCTAssertEqual(snap.activeConnections, 3)
+        XCTAssertEqual(snap.routeCounts["GET:///"], 7)
+    }
+
+    func testErrorRate_zeroRequests() {
+        let snap = MetricsSnapshot(totalRequests: 0, totalErrors: 0,
+                                   activeConnections: 0, routeCounts: [:])
+        XCTAssertEqual(snap.errorRate, 0.0)
+    }
+
+    func testErrorRate_withErrors() {
+        let snap = MetricsSnapshot(totalRequests: 4, totalErrors: 1,
+                                   activeConnections: 0, routeCounts: [:])
+        XCTAssertEqual(snap.errorRate, 0.25, accuracy: 0.001)
+    }
+
+    func testEncodable_includesAllKeys() throws {
+        let snap = MetricsSnapshot(totalRequests: 5, totalErrors: 1,
+                                   activeConnections: 2, routeCounts: ["GET:///": 5])
+        let data = try JSONEncoder().encode(snap)
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertNotNil(obj?["totalRequests"])
+        XCTAssertNotNil(obj?["totalErrors"])
+        XCTAssertNotNil(obj?["activeConnections"])
+        XCTAssertNotNil(obj?["routeCounts"])
+    }
+}
+
+// MARK: - Phase 4: AdminConsoleDelegate TLS defaults
+
+private final class MinimalDelegate4: AdminConsoleDelegate {}
+
+final class AdminConsoleDelegatePhase4Tests: XCTestCase {
+
+    func testDefaultReloadTLSCertificate_doesNotThrow() async throws {
+        let d = MinimalDelegate4()
+        // Default calls reloadTLSCertificates() which is itself a no-op default
+        try await d.reloadTLSCertificate(for: "example.com")
+    }
+}
+
+// MARK: - Phase 4: AdminWebUI metrics + TLS ops
+
+final class AdminWebUIPhase4Tests: XCTestCase {
+
+    private func loadHTML() async throws -> String {
+        let output = AdminWebUI.response(tokenFilePath: "/tmp/tok.token")
+        var body: [UInt8] = []
+        let alloc = ByteBufferAllocator()
+        var chunk = try await output.nextChunk(allocator: alloc)
+        while let buf = chunk {
+            body.append(contentsOf: buf.readableBytesView)
+            chunk = try await output.nextChunk(allocator: alloc)
+        }
+        return String(decoding: body, as: UTF8.self)
+    }
+
+    func testResponse_containsMetricsCard() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("metrics-rows"), "Metrics card missing from HTML")
+        XCTAssertTrue(html.contains("Metrics"), "Metrics heading missing")
+    }
+
+    func testResponse_containsRenderMetrics() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("renderMetrics"), "renderMetrics JS function missing")
+        XCTAssertTrue(html.contains("/api/metrics"), "metrics API endpoint missing from JS")
+    }
+
+    func testResponse_containsTLSReloadFunction() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("tlsReload"), "tlsReload JS function missing")
+        XCTAssertTrue(html.contains("/api/tls/reload"), "TLS reload endpoint missing from JS")
+    }
+
+    func testResponse_containsTLSRemoveFunction() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("tlsRemove"), "tlsRemove JS function missing")
+        XCTAssertTrue(html.contains("/api/tls/domain"), "TLS remove endpoint missing from JS")
+    }
+}
+
+// MARK: - Phase 5: DatasourceConfigInfo
+
+final class DatasourceConfigInfoTests: XCTestCase {
+
+    func testInit_storesAllFields() {
+        let cfg = DatasourceConfigInfo(id: "staging", label: "Staging", description: "staging.db", isActive: true)
+        XCTAssertEqual(cfg.id, "staging")
+        XCTAssertEqual(cfg.label, "Staging")
+        XCTAssertEqual(cfg.description, "staging.db")
+        XCTAssertTrue(cfg.isActive)
+    }
+
+    func testInit_isActiveDefaultsFalse() {
+        let cfg = DatasourceConfigInfo(id: "prod", label: "Production", description: "prod.db")
+        XCTAssertFalse(cfg.isActive)
+    }
+
+    func testInit_emptyStringsAllowed() {
+        let cfg = DatasourceConfigInfo(id: "", label: "", description: "")
+        XCTAssertEqual(cfg.id, "")
+        XCTAssertEqual(cfg.label, "")
+        XCTAssertEqual(cfg.description, "")
+    }
+
+    func testSendable_usableAcrossActors() async {
+        let cfg = DatasourceConfigInfo(id: "dev", label: "Dev", description: "dev.db", isActive: false)
+        let result = await Task.detached { cfg }.value
+        XCTAssertEqual(result.id, "dev")
+    }
+}
+
+// MARK: - Phase 5: AdminConsoleDelegate defaults
+
+private final class MinimalDelegate5: AdminConsoleDelegate {}
+
+final class AdminConsoleDelegatePhase5Tests: XCTestCase {
+
+    func testDefaultAvailableConfigs_isEmpty() async {
+        let d = MinimalDelegate5()
+        let configs = await d.availableConfigs(for: "mysql-main")
+        XCTAssertTrue(configs.isEmpty, "Default availableConfigs should return empty array")
+    }
+
+    func testDefaultSwitchDatasource_returnsFailed() async throws {
+        let d = MinimalDelegate5()
+        let result = try await d.switchDatasource(name: "mysql-main", to: "staging")
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.message.contains("mysql-main"), "Error message should name the datasource")
+    }
+
+    func testDefaultSwitchDatasource_latencyIsNil() async throws {
+        let d = MinimalDelegate5()
+        let result = try await d.switchDatasource(name: "any", to: "any-config")
+        XCTAssertNil(result.latencyMs)
+    }
+}
+
+// MARK: - Phase 5: AdminWebUI config switcher
+
+final class AdminWebUIPhase5Tests: XCTestCase {
+
+    private func loadHTML() async throws -> String {
+        let output = AdminWebUI.response(tokenFilePath: "/tmp/tok.token")
+        var body: [UInt8] = []
+        let alloc = ByteBufferAllocator()
+        var chunk = try await output.nextChunk(allocator: alloc)
+        while let buf = chunk {
+            body.append(contentsOf: buf.readableBytesView)
+            chunk = try await output.nextChunk(allocator: alloc)
+        }
+        return String(decoding: body, as: UTF8.self)
+    }
+
+    func testResponse_containsCfgSelectCSS() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("cfg-select"), "cfg-select CSS class missing from HTML")
+    }
+
+    func testResponse_containsSwitchDSFunction() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("switchDS"), "switchDS JS function missing from HTML")
+    }
+
+    func testResponse_containsDatasourceSwitchEndpoint() async throws {
+        let html = try await loadHTML()
+        XCTAssertTrue(html.contains("/api/datasources/switch"), "datasource switch endpoint missing from JS")
+    }
+
+    func testResponse_switchDSPostsWithCSRFHeader() async throws {
+        let html = try await loadHTML()
+        // switchDS must use POST and include the CSRF header
+        let hasPost = html.contains("method: 'POST'") || html.contains("method:\"POST\"") || html.contains("method: \"POST\"")
+        XCTAssertTrue(hasPost, "switchDS should use POST method")
+        XCTAssertTrue(html.contains("X-Admin-CSRF"), "switchDS must include X-Admin-CSRF header")
+    }
 }
