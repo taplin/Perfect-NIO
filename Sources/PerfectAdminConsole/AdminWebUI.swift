@@ -96,7 +96,18 @@ main{padding:20px;max-width:980px;margin:0 auto}
 .mini-btn{padding:3px 9px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);cursor:pointer;font-size:11px;font-weight:600;white-space:nowrap}
 .mini-btn:hover{background:var(--accent);color:#fff}
 /* ---- config switcher ---- */
-.cfg-select{padding:3px 6px;border:1px solid var(--border);border-radius:5px;background:var(--card);color:var(--text);font-size:11px;cursor:pointer;max-width:120px}
+.cfg-select{padding:3px 6px;border:1px solid var(--border);border-radius:5px;background:var(--card);color:var(--text);font-size:11px;cursor:pointer;max-width:220px}
+/* ---- datasource table (full-width, 3-column, nothing clipped) ---- */
+#datasource-card{margin-bottom:14px}
+.ds-table{display:grid;grid-template-columns:minmax(180px,1.3fr) minmax(220px,1.6fr) minmax(170px,auto);gap:8px 20px;align-items:start}
+.ds-head{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.ds-divider{grid-column:1/-1;height:1px;background:var(--border)}
+.ds-cell{min-width:0;padding:2px 0}
+.ds-controls{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.ds-name{font-weight:600}
+.ds-sub{color:var(--muted);font-size:12px;margin-top:2px}
+.ds-active{color:var(--ok);font-size:12px}
+@media(max-width:680px){.ds-table{grid-template-columns:1fr}.ds-head{display:none}}
 /* ---- actions section ---- */
 #actions-section{margin-top:14px}
 .action-btn{padding:5px 12px;border:1px solid var(--accent);border-radius:6px;background:transparent;color:var(--accent);cursor:pointer;font-size:12px;font-weight:600;transition:background .15s,color .15s}
@@ -134,9 +145,9 @@ main{padding:20px;max-width:980px;margin:0 auto}
       <div class="card"><h2>TLS Domains</h2><div id="tls-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
       <div class="card"><h2>ACME Challenges</h2><div id="acme-rows"><div class="row"><span class="rl">Loading…</span></div></div></div>
       <div class="card"><h2>Routes</h2><div id="routes-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
-      <div class="card" id="datasource-card"><h2>Datasources</h2><div id="datasource-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
       <div class="card"><h2>Metrics</h2><div id="metrics-rows"><div class="row"><span class="rl">Loading…</span></div></div></div>
     </div>
+    <div class="card" id="datasource-card"><h2>Datasources</h2><div id="datasource-content"><div class="row"><span class="rl">Loading…</span></div></div></div>
     <div class="card" id="log-card">
       <h2>Log Tail <span id="log-meta" style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)"></span></h2>
       <div class="log-box" id="log-box">Loading…</div>
@@ -321,12 +332,16 @@ function renderDatasources(d) {
     el.innerHTML = '<div class="row"><span class="rl" style="color:var(--muted)">No datasources registered</span></div>';
     return;
   }
-  el.innerHTML = d.datasources.map(ds => {
+  let h = '<div class="ds-table">';
+  h += '<div class="ds-head">Datasource</div><div class="ds-head">Active Connection</div><div class="ds-head">Actions</div>';
+  h += '<div class="ds-divider"></div>';
+  h += d.datasources.map(ds => {
     const safeName = esc(ds.name).replace(/'/g, "\\'");
     const active = (ds.configs || []).find(c => c.isActive);
-    const activeLabel = active
-      ? '<br><small style="color:var(--ok)">● ' + esc(active.label) + (active.description ? ' · ' + esc(active.description) : '') + '</small>'
-      : '';
+    const activeHTML = active
+      ? '<div class="ds-active">● ' + esc(active.label) + '</div>' +
+        (active.description ? '<div class="ds-sub">' + esc(active.description) + '</div>' : '')
+      : '<div class="ds-sub">—</div>';
     // Config switcher: only shown when >1 config is available
     const configs = ds.configs || [];
     let controls = '';
@@ -335,16 +350,18 @@ function renderDatasources(d) {
       const opts = configs.map(c =>
         '<option value="' + esc(c.id) + '"' + (c.isActive ? ' selected' : '') + '>' + esc(c.label) + '</option>'
       ).join('');
-      controls += '<select id="' + selId + '" class="cfg-select">' + opts + '</select> ';
-      controls += '<button class="mini-btn" onclick="switchDS(\'' + safeName + '\',document.getElementById(\'' + selId + '\').value)">Switch</button> ';
+      controls += '<select id="' + selId + '" class="cfg-select">' + opts + '</select>';
+      controls += '<button class="mini-btn" onclick="switchDS(\'' + safeName + '\',document.getElementById(\'' + selId + '\').value)">Switch</button>';
     }
     controls += '<button class="mini-btn" onclick="testDS(\'' + safeName + '\')">Test</button>';
-    return '<div class="row">' +
-      '<span class="rl">' + esc(ds.alias || ds.name) + activeLabel +
-      '<br><small style="color:var(--muted)">' + esc(ds.driver) + ' · ' + esc(ds.schema) + '</small></span>' +
-      '<span class="rv" style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;align-items:center">' + controls + '</span>' +
-      '</div>';
+    return '<div class="ds-cell"><div class="ds-name">' + esc(ds.alias || ds.name) + '</div>' +
+      '<div class="ds-sub">' + esc(ds.driver) + ' · ' + esc(ds.schema) + '</div></div>' +
+      '<div class="ds-cell">' + activeHTML + '</div>' +
+      '<div class="ds-cell ds-controls">' + controls + '</div>' +
+      '<div class="ds-divider"></div>';
   }).join('');
+  h += '</div>';
+  el.innerHTML = h;
 }
 
 async function switchDS(name, configID) {
