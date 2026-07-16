@@ -75,19 +75,27 @@ public struct Server: Sendable {
 	/// Number of server sockets to open on the same port via `SO_REUSEPORT` (kernel load-balances
 	/// accepts across them). 1 = a single socket with no `SO_REUSEPORT`.
 	public var reusePortCount: Int
+	/// When `true`, always sets `SO_REUSEPORT` on this server's listening socket, independent of
+	/// `reusePortCount` — lets a second, independent OS process bind the identical port while this
+	/// one is still running (a graceful hand-off restart: the new process starts accepting before
+	/// the old one stops), without opening multiple sockets within *this* process. Defaults to
+	/// `false`, preserving the existing exclusive-bind behavior for a single socket.
+	public var alwaysReusePort: Bool
 
 	public init(routes: Routes<HTTPRequest, HTTPOutput>,
 	            host: String = "0.0.0.0",
 	            port: Int,
 	            tls: TLSConfiguration? = nil,
 	            idleTimeout: TimeAmount? = .seconds(60),
-	            reusePortCount: Int = 1) {
+	            reusePortCount: Int = 1,
+	            alwaysReusePort: Bool = false) {
 		self.routes = routes
 		self.host = host
 		self.port = port
 		self.tls = tls
 		self.idleTimeout = idleTimeout
 		self.reusePortCount = reusePortCount
+		self.alwaysReusePort = alwaysReusePort
 	}
 
 	/// Bind and serve until the surrounding task is cancelled, then gracefully drain in-flight
@@ -176,7 +184,7 @@ public struct Server: Sendable {
 	                  finder: any RouteFinder,
 	                  isTLS: Bool) async throws -> [HTTPServerChannel] {
 		let count = max(1, reusePortCount)
-		let reusePort = count > 1
+		let reusePort = count > 1 || alwaysReusePort
 		let idle = idleTimeout
 		let host = self.host
 		let port = self.port
