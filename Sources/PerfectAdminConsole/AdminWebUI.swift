@@ -197,10 +197,10 @@ async function api(path) {
 
 async function refresh() {
   try {
-    const [status, tls, acme, logs, routes, datasources, metrics] = await Promise.all([
+    const [status, tls, acme, logs, routes, datasources, metrics, actions] = await Promise.all([
       api('/api/status'), api('/api/tls'), api('/api/acme'),
       api('/api/logs?count=100'), api('/api/routes'), api('/api/datasources'),
-      api('/api/metrics'),
+      api('/api/metrics'), api('/api/actions'),
     ]);
     renderStatus(status);
     renderTLS(tls);
@@ -209,6 +209,10 @@ async function refresh() {
     renderRoutes(routes);
     renderDatasources(datasources);
     renderMetrics(metrics);
+    // Re-rendered every cycle (not just on first load) so an action whose
+    // description reflects live state — e.g. a crawl-report delegate
+    // showing "Running now — 340/1,989 pages" — updates without a reload.
+    renderActions(actions.actions || []);
     if (status.additionalSections && status.additionalSections.length)
       renderDelegate(status.additionalSections);
     document.getElementById('refresh-badge').textContent =
@@ -408,13 +412,9 @@ function renderDelegate(sections) {
 }
 
 // ---- Phase 2: actions ----
-
-async function loadActions() {
-  try {
-    const data = await api('/api/actions');
-    renderActions(data.actions || []);
-  } catch(e) { /* silent — actions section simply stays empty */ }
-}
+// Fetched as part of refresh()'s Promise.all so the actions section (and
+// any live status a delegate bakes into an action's description) updates
+// on every periodic tick, not just once at page load.
 
 function renderActions(actions) {
   const el = document.getElementById('actions-section');
@@ -502,7 +502,6 @@ function showDashboard() {
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
   refresh();
-  loadActions();
   clearInterval(refreshIntervalId);
   countdown = 5;
   refreshIntervalId = setInterval(() => {
