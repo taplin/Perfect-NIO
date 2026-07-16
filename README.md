@@ -500,6 +500,34 @@ TOKEN=$(cat /var/run/myapp-admin.token)
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8990/api/status | jq
 ```
 
+### Web dashboard
+
+`GET /` (no auth) serves a self-contained HTML/CSS/JS dashboard — no
+external resources, dark/light mode via `prefers-color-scheme`. Open
+`http://127.0.0.1:<port>` in a browser, paste the token from the file
+above into the field, and click **Connect**. The token is kept in
+`sessionStorage` for the tab's lifetime (cleared on tab close or on a 401
+— e.g. after a restart rotates the token), so you re-paste it after every
+process restart.
+
+Once connected, the dashboard polls every endpoint on a 5-second cycle
+(visible as "refresh in Ns" under the log card) and renders one card per
+concern:
+
+- **Server Status** — admin port, delegate's `serverPort`/uptime, TLS domain count, ACME pending-challenge count.
+- **TLS Domains** — registered hostnames with per-domain **Reload**/**Remove** buttons (only meaningful if a `tlsManager` was passed to `init`).
+- **ACME Challenges** — pending challenge count.
+- **Routes** — `registeredRoutes` from the delegate, as tags.
+- **Metrics** — total requests/errors, active connections, error rate, and the top 5 busiest routes (only populated if an `AdminMetrics` instance was passed to `init` and the host app calls `recordRequest`/`recordError`).
+- **Datasources** — a full-width, 3-column table (Datasource / Active Connection / Actions) — deliberately pulled out of the summary-card grid rather than squeezed into a narrow auto-fill cell, since a row's controls (a config-switcher `<select>` plus Switch/Test buttons) need real width to avoid clipping. Collapses to a single stacked column below 680px viewport width. Each row shows the delegate-reported `driver`/`schema`, the currently active `DatasourceConfigInfo` (if `availableConfigs(for:)` returns any), a **Test** button (always), and a config `<select>` + **Switch** button (only when more than one config is available for that datasource).
+- **Log Tail** — the most recent `LogCapture` lines, auto-scrolling if you were already scrolled to the bottom; a footer shows "showing N of M captured".
+- **Delegate sections** — one card per `AdminStatusSection` returned by `additionalStatusSections()`, rendered as simple label/value rows.
+- **Actions** — grouped by `category`, one card per category, one row per `AdminAction`. A `description` is plain text but can be **built fresh on every `availableActions()` call** to reflect live delegate state (e.g. "Running now — 340/1,989 items, started 2m ago" for a long-running action) — since the dashboard re-fetches `/api/actions` on every 5-second refresh (not just once at page load), a live-updating description shows up without a manual reload. Destructive actions (`isDestructive: true`) show a confirmation dialog before executing.
+
+If a request fails (network error, or a 500), the header's "updated
+HH:MM:SS" text is replaced with "error: ...". A 401 anywhere logs the
+session out and returns to the token-entry screen.
+
 ### Phase 1 — read-only API
 
 All endpoints require `Authorization: Bearer <token>`.
