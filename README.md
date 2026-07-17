@@ -761,9 +761,14 @@ public struct Server: Sendable {
     public var port: Int
     public var tls: TLSConfiguration?
     public var idleTimeout: TimeAmount?  // default .seconds(60) — nil disables
-    public var reusePortCount: Int       // default 1; >1 enables SO_REUSEPORT
+    public var reusePortCount: Int       // default 1; >1 opens multiple sockets in *this* process via SO_REUSEPORT
+    public var alwaysReusePort: Bool     // default false; sets SO_REUSEPORT on a single socket so a
+                                          // *different* process can bind the same port concurrently —
+                                          // the primitive a graceful hand-off restart needs: start a new
+                                          // process, confirm it's bound and healthy, only then stop the old
+                                          // one — with zero window where the port refuses connections.
 
-    public init(routes:, host:, port:, tls:, idleTimeout:, reusePortCount:)
+    public init(routes:, host:, port:, tls:, idleTimeout:, reusePortCount:, alwaysReusePort:)
 
     /// Serve until the surrounding Task is cancelled.
     public func run() async throws
