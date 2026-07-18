@@ -49,6 +49,34 @@ final class AdminTokenStoreTests: XCTestCase {
         XCTAssertNotEqual(s1.token, s2.token)
     }
 
+    func testInit_reusesExistingTokenAcrossRestartsBySameFilePath() throws {
+        let path = tempTokenPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let first = try AdminTokenStore(tokenFilePath: path)
+        let second = try AdminTokenStore(tokenFilePath: path)
+        XCTAssertEqual(first.token, second.token)
+    }
+
+    func testInit_forceNewTokenRotatesEvenAtSameFilePath() throws {
+        let path = tempTokenPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let first = try AdminTokenStore(tokenFilePath: path)
+        let second = try AdminTokenStore(tokenFilePath: path, forceNewToken: true)
+        XCTAssertNotEqual(first.token, second.token)
+        // The rotated token is what actually got persisted to disk.
+        let contents = try String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(contents, second.token)
+    }
+
+    func testInit_fallsBackToFreshTokenWhenExistingFileIsMalformed() throws {
+        let path = tempTokenPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try "not-a-valid-token".write(toFile: path, atomically: true, encoding: .utf8)
+        let store = try AdminTokenStore(tokenFilePath: path)
+        XCTAssertEqual(store.token.count, 64)
+        XCTAssertTrue(store.token.allSatisfy { "0123456789abcdef".contains($0) })
+    }
+
     func testRequireAuth_validToken_doesNotThrow() throws {
         let path = tempTokenPath()
         defer { try? FileManager.default.removeItem(atPath: path) }

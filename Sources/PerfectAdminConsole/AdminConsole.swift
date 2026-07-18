@@ -107,8 +107,14 @@ public actor AdminConsole {
 
     /// - Parameters:
     ///   - port: Port for the admin server. Default 8990.
-    ///   - tokenFilePath: Path where the generated bearer token is written (chmod 600).
-    ///     Example: `/var/run/myapp-admin.token` or `$TMPDIR/myapp-admin.token`.
+    ///   - tokenFilePath: Path where the bearer token is read from (if reusing)
+    ///     and written to (chmod 600). Example: `/var/run/myapp-admin.token`
+    ///     or `$TMPDIR/myapp-admin.token`.
+    ///   - forceNewToken: When `true`, always generates and writes a fresh
+    ///     token, overwriting any existing one at `tokenFilePath` — the
+    ///     explicit rotation path. Default `false`: reuse the existing
+    ///     file's token across restarts if it's present and well-formed,
+    ///     so the dashboard doesn't need re-pasting after every launch.
     ///   - tlsManager: The live TLS manager from the main server, for cert status display.
     ///   - acmeResponder: The ACME challenge store, for pending-challenge display.
     ///   - logCapture: Ring buffer that the host feeds log lines into; `nil` means no log tail.
@@ -116,6 +122,7 @@ public actor AdminConsole {
     public init(
         port: Int = 8990,
         tokenFilePath: String,
+        forceNewToken: Bool = false,
         tlsManager: TLSContextManager? = nil,
         acmeResponder: ACMEChallengeResponder? = nil,
         logCapture: LogCapture? = nil,
@@ -123,7 +130,7 @@ public actor AdminConsole {
         delegate: (any AdminConsoleDelegate)? = nil
     ) throws {
         self.port = port
-        self.tokenStore = try AdminTokenStore(tokenFilePath: tokenFilePath)
+        self.tokenStore = try AdminTokenStore(tokenFilePath: tokenFilePath, forceNewToken: forceNewToken)
         self.tlsManager = tlsManager
         self.acmeResponder = acmeResponder
         self.logCapture = logCapture
