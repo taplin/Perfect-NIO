@@ -48,6 +48,53 @@
 import Foundation
 import PerfectNIO
 
+/// Hand-builds JSON text with guaranteed key order.
+///
+/// `JSONEncoder` does not preserve object key order — confirmed
+/// empirically, including through a manually-populated
+/// `KeyedEncodingContainer` with a dynamic `CodingKey` (Foundation's
+/// encoder still re-orders keys internally before final serialization).
+/// This made status card items visibly shuffle between dashboard
+/// refreshes, since `additionalSections[].items` came from
+/// `AdminStatusSection`'s deliberately-ordered array. There is no
+/// `Encodable`-based way to guarantee order on this platform, so anywhere
+/// order matters, these helpers build the JSON text directly instead —
+/// order here is exactly interpolation order, which browsers' own
+/// `Object.entries()`/JSON parsers do preserve.
+enum JSONText {
+    /// A JSON string literal, with escaping.
+    static func string(_ s: String) -> String {
+        var out = "\""
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if scalar.value < 0x20 {
+                    out += String(format: "\\u%04x", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        out += "\""
+        return out
+    }
+
+    /// An ordered `{"key":"value",...}` object from string pairs.
+    static func object(_ pairs: [(key: String, value: String)]) -> String {
+        "{" + pairs.map { "\(string($0.key)):\(string($0.value))" }.joined(separator: ",") + "}"
+    }
+
+    /// A `{"title":"...","items":{...}}` object for one `AdminStatusSection`.
+    static func section(title: String, items: [(key: String, value: String)]) -> String {
+        "{\"title\":\(string(title)),\"items\":\(object(items))}"
+    }
+}
+
 public actor AdminConsole {
 
     private let port: Int
@@ -125,32 +172,21 @@ public actor AdminConsole {
                 uptimeSecs = nil
             }
             let extraSections = await delegate?.additionalStatusSections() ?? []
+            let effectiveServerPort = (serverPort ?? 0) != 0 ? serverPort : nil
 
-            struct SectionEnc: Encodable {
-                let title: String
-                let items: [String: String]
-            }
-            struct StatusEnc: Encodable {
-                let adminPort: Int
-                let serverPort: Int?
-                let uptimeSeconds: Double?
-                let tlsDomainCount: Int
-                let tlsHasDefault: Bool
-                let acmePendingChallenges: Int
-                let additionalSections: [SectionEnc]
-            }
-            let resp = StatusEnc(
-                adminPort: adminPort,
-                serverPort: (serverPort ?? 0) != 0 ? serverPort : nil,
-                uptimeSeconds: uptimeSecs,
-                tlsDomainCount: domains.count,
-                tlsHasDefault: hasDefault,
-                acmePendingChallenges: pendingACME,
-                additionalSections: extraSections.map {
-                    SectionEnc(title: $0.title, items: Dictionary(uniqueKeysWithValues: $0.items))
-                }
+            // Hand-built, not `Encodable`/`JSONEncoder` — see `JSONText`'s
+            // doc comment for why: this is the only way to guarantee
+            // `additionalSections[].items` keeps its original order.
+            let sectionsJSON = extraSections
+                .map { JSONText.section(title: $0.title, items: $0.items) }
+                .joined(separator: ",")
+            let body = """
+            {"adminPort":\(adminPort),"serverPort":\(effectiveServerPort.map(String.init) ?? "null"),"uptimeSeconds":\(uptimeSecs.map { String($0) } ?? "null"),"tlsDomainCount":\(domains.count),"tlsHasDefault":\(hasDefault),"acmePendingChallenges":\(pendingACME),"additionalSections":[\(sectionsJSON)]}
+            """
+            return BytesOutput(
+                head: HTTPHead(headers: HTTPHeaders([("content-type", "application/json")])),
+                body: Array(body.utf8)
             )
-            return try JSONOutput(resp)
         }
 
         // GET /api/tls — per-domain cert list

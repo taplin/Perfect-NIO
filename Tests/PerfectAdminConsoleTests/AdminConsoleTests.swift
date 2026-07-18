@@ -158,6 +158,55 @@ final class AdminConsoleDelegateTests: XCTestCase {
     }
 }
 
+// MARK: - JSONText (regression coverage for the status-card item-shuffle bug)
+//
+// `JSONEncoder` does not preserve object key order — confirmed empirically
+// (a first attempt at this fix used a manually-populated
+// `KeyedEncodingContainer` with a dynamic `CodingKey`, and Foundation's
+// encoder STILL reordered it), which made status card contents visibly
+// shuffle between dashboard refreshes. `JSONText` bypasses `Encodable`
+// entirely and builds JSON text directly, so these tests check the actual
+// string output, not a re-decoded (and therefore re-unordered) value.
+
+final class JSONTextTests: XCTestCase {
+
+    func testString_escapesQuotesBackslashesAndControlCharacters() {
+        XCTAssertEqual(JSONText.string(#"say "hi""#), #""say \"hi\"""#)
+        XCTAssertEqual(JSONText.string(#"a\b"#), #""a\\b""#)
+        XCTAssertEqual(JSONText.string("line1\nline2"), "\"line1\\nline2\"")
+        XCTAssertEqual(JSONText.string("plain"), "\"plain\"")
+    }
+
+    func testObject_preservesDeliberatelyUnalphabeticalOrder() {
+        // Deliberately not alphabetical and not any obvious hash order —
+        // if this ever routes back through JSONEncoder/Dictionary, key
+        // order becomes unspecified and this assertion would catch it.
+        let json = JSONText.object([
+            ("Zebra", "1"), ("Apple", "2"), ("Mango", "3"), ("Banana", "4"),
+        ])
+        let positions = ["Zebra", "Apple", "Mango", "Banana"].map {
+            json.range(of: "\"\($0)\"")!.lowerBound
+        }
+        XCTAssertEqual(positions, positions.sorted(), "keys should appear in insertion order, not any other order")
+    }
+
+    func testObject_repeatedCallsAreStable() {
+        let pairs: [(key: String, value: String)] = [
+            ("Enabled", "yes"), ("Mode", "ARMED"), ("Poll interval", "20s"), ("Min floor", "5"),
+        ]
+        XCTAssertEqual(JSONText.object(pairs), JSONText.object(pairs))
+    }
+
+    func testObject_emptyProducesEmptyObject() {
+        XCTAssertEqual(JSONText.object([]), "{}")
+    }
+
+    func testSection_buildsExpectedShape() {
+        let json = JSONText.section(title: "My App", items: [("Key", "Value"), ("Foo", "Bar")])
+        XCTAssertEqual(json, #"{"title":"My App","items":{"Key":"Value","Foo":"Bar"}}"#)
+    }
+}
+
 // MARK: - TLSContextManager additions
 
 final class TLSContextManagerAdminTests: XCTestCase {
