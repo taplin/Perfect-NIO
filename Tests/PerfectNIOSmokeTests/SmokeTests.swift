@@ -443,6 +443,35 @@ final class PerfectNIOSmokeTests: XCTestCase {
         }
     }
 
+    /// `HTTPRequest.cookies` previously split every "=" in a cookie pair
+    /// unboundedly, so any value containing an embedded "=" (extremely
+    /// common for base64-encoded/padded tokens) produced 3+ parts and got
+    /// silently dropped by the `d.count == 2` guard -- the whole cookie
+    /// vanished rather than just losing its trailing content. Confirmed by
+    /// a real report of cookies "not being propagated" for a scrubs.test
+    /// store cookie carrying an encoded value.
+    func testCookiesWithEmbeddedEqualsSignsAreNotDropped() async throws {
+        let routes = root().cookiecheck.request { _, req in
+            req.cookies.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: "|")
+        }.text()
+        try await withServer(routes) {
+            var request = URLRequest(url: url("/cookiecheck"))
+            // URLSession otherwise manages the `Cookie` header itself via
+            // its own cookie jar and silently ignores a manually-set value.
+            request.httpShouldHandleCookies = false
+            request.setValue(
+                "plain=abc; padded=dGVzdA==; multi=a=b=c",
+                forHTTPHeaderField: "Cookie"
+            )
+            let (data, response) = try await session.data(for: request)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            XCTAssertEqual(
+                String(data: data, encoding: .utf8),
+                "multi=a=b=c|padded=dGVzdA==|plain=abc"
+            )
+        }
+    }
+
     /// routes.describe lists the URI key for every registered route.
     func testDescribeRoutes() throws {
         let routes = try root().dir(
