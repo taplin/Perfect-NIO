@@ -1,9 +1,9 @@
 <p align="center">
     <a href="https://developer.apple.com/swift/" target="_blank">
-        <img src="https://img.shields.io/badge/Swift-6.0-orange.svg?style=flat" alt="Swift 6.0">
+        <img src="https://img.shields.io/badge/Swift-6.2-orange.svg?style=flat" alt="Swift 6.2">
     </a>
     <a href="https://developer.apple.com/swift/" target="_blank">
-        <img src="https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux-lightgray.svg?style=flat" alt="Platforms macOS | Linux">
+        <img src="https://img.shields.io/badge/Platforms-macOS%2026%2B%20%7C%20Linux-lightgray.svg?style=flat" alt="Platforms macOS 26+ | Linux">
     </a>
     <a href="http://perfect.org/licensing.html" target="_blank">
         <img src="https://img.shields.io/badge/License-Apache-lightgrey.svg?style=flat" alt="License Apache">
@@ -12,7 +12,9 @@
 
 # PerfectNIO
 
-A Swift 6 HTTP(S) server library built on SwiftNIO. Routes are a composable, strongly-typed pipeline: each step accepts one type and produces another, terminating in an `HTTPOutput` that writes the response. The library is an updated resurrection of the original [Perfect-NIO](https://github.com/PerfectlySoft/Perfect-NIO) project.
+A Swift 6 HTTP(S) server library built on SwiftNIO. Routes are a composable, strongly-typed pipeline: each step accepts one type and produces another, terminating in an `HTTPOutput` that writes the response. The library is an updated resurrection of the original [Perfect-NIO](https://github.com/PerfectlySoft/Perfect-NIO) project, part of the broader Perfect-Resurrection effort.
+
+**Ecosystem role:** PerfectNIO is the core HTTP/server layer for this resurrection effort — it is depended on directly, in production, by Perfect-Lasso (a live Lasso-language e-commerce site runs on top of it today), plus `FMTestApp` and `PerfectTemplate`. It is not a standalone demo library; changes here are load-bearing for a real running application. Logging is done via `import Logging` (apple/swift-log) directly — there is no dependency on Perfect-Logger.
 
 - [Quick start](#quick-start)
 - [Package.swift](#packageswift)
@@ -24,6 +26,7 @@ A Swift 6 HTTP(S) server library built on SwiftNIO. Routes are a composable, str
 - [WebSocket](#websocket)
 - [TLS / HTTPS](#tls--https)
 - [Admin console](#admin-console)
+- [PerfectNIOCRUD](#perfectniocrud)
 - [Reference](#reference)
 - [Linux support](#linux-support)
 
@@ -41,6 +44,8 @@ try await Server(routes: routes, port: 8080).run()
 
 Build and run with `swift run`. The server listens on port 8080 and responds to every request with `Hello, world!`.
 
+The package also builds a `PerfectNIOExe` executable target (`Sources/PerfectNIOExe/main.swift`) — a minimal smoke-test binary, not a required entry point. Host applications define their own executable target as shown above.
+
 ### Scoped server (useful in tests)
 
 ```swift
@@ -56,7 +61,7 @@ try await Server(routes: routes, port: 8080).withServer { boundPort in
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/taplin/Perfect-NIO.git", branch: "swiftCoreUpdate"),
+    .package(url: "https://github.com/taplin/Perfect-NIO.git", branch: "main"),
 ],
 targets: [
     .target(
@@ -70,7 +75,15 @@ targets: [
 
 Your code will typically `import PerfectNIO`. The library re-exports `NIO`, `NIOHTTP1`, and `NIOSSL`, so you usually do not need to import those separately.
 
-Optional: add `PerfectNIOMustache` for Mustache template output.
+**In-ecosystem consumers** (Perfect-Lasso, `FMTestApp`, `PerfectTemplate`) don't use the GitHub remote above — they check out this repo as a sibling directory and depend on it via a local path:
+
+```swift
+.package(path: "../Perfect-NIO"),
+```
+
+This package's own `Package.swift` resolves `PerfectNIOCRUD` and the `PerfectNIOMySQLTests` test target via two more local path dependencies: `.package(path: "../Perfect-CRUD")` and `.package(path: "../Perfect-MySQL")`. Because SwiftPM resolves a manifest's full dependency graph up front, those sibling checkouts must exist at `../Perfect-CRUD` and `../Perfect-MySQL` for `swift build`/`swift test` to resolve at all — cloning this repo on its own, without the sibling directories present, will fail dependency resolution. This repo is not currently buildable/testable in isolation.
+
+There is no `PerfectNIOMustache` target — an earlier version of this package had one, but it was deliberately removed (dead weight pulling in an unresurrected `PerfectLib`). Mustache template output is not currently available.
 
 ---
 
@@ -336,22 +349,6 @@ root().logo {
 }.ext("png")
 ```
 
-### MustacheOutput
-
-Renders a Mustache template (requires the `PerfectNIOMustache` target).
-
-```swift
-import PerfectNIOMustache
-
-root().page {
-    try MustacheOutput(
-        templatePath: "/var/www/template.html",
-        inputs: ["title": "Home", "items": items],
-        contentType: "text/html"
-    ) as HTTPOutput
-}.ext("html")
-```
-
 ---
 
 ## Custom HTTPOutput
@@ -452,6 +449,17 @@ let tls  = TLSConfiguration.makeServerConfiguration(
 
 try await Server(routes: routes, port: 443, tls: tls).run()
 ```
+
+### Advanced: multi-tenant / hot-reloadable TLS
+
+Beyond the single static `TLSConfiguration` shown above, `Sources/PerfectNIO` also contains real infrastructure for live, multi-tenant, per-domain TLS:
+
+- `TLSContextManager` — maps hostnames to `NIOSSLContext`s, selected via SNI at handshake time; assign it to `Server`'s `tlsManager` property (see [Reference > Server](#server)) to serve multiple domains, each with its own certificate, from one process.
+- `CertificateWatcher` — watches certificate files on disk and hot-reloads them into the manager without dropping connections (e.g. after `certbot renew`).
+- `ACMEChallengeResponder` — answers HTTP-01 ACME challenges inline in the route pipeline.
+- `SNIPeekHandler` — peeks the ClientHello's SNI extension before the TLS handshake completes, to route to the right context.
+
+`PerfectAdminConsole`'s TLS Domains card and `POST /api/tls/reload` / `DELETE /api/tls/domain` endpoints (below) operate on exactly this `tlsManager`.
 
 ---
 
@@ -750,6 +758,35 @@ await capture.capture("2026-07-14 10:00:00 [INFO] Server started")
 
 ---
 
+## PerfectNIOCRUD
+
+`PerfectNIOCRUD` is a thin bridge target (`Sources/PerfectNIOCRUD/RouteCRUD.swift`) that adds two route operators, `.db(_:_:)` and `.table(_:_:_:)`, exposing a Perfect-CRUD `Database`/`Table` into the route pipeline so handlers can query/mutate through Perfect-CRUD without hand-wiring a connection per request. It depends on the local `../Perfect-CRUD` package (see [Package.swift](#packageswift)), and is exercised by the `PerfectNIOMySQLTests` test target against Perfect-MySQL.
+
+```swift
+dependencies: [
+    .product(name: "PerfectNIO", package: "Perfect-NIO"),
+    .product(name: "PerfectNIOCRUD", package: "Perfect-NIO"),
+]
+```
+
+```swift
+import PerfectNIOCRUD
+
+struct User: Codable, Sendable { let id: Int; let name: String }
+
+// .db — hand the raw Database through to your own closure
+let routes = root().users.db(makeDatabase()) { _, db in
+    try db.table(User.self).select()
+}.json()
+
+// .table — go straight to a Table<User, Database<C>>
+let routes2 = root().users.table(makeDatabase(), User.self) { _, table in
+    try table.select()
+}.json()
+```
+
+---
+
 ## Reference
 
 ### Server
@@ -760,6 +797,9 @@ public struct Server: Sendable {
     public var host: String              // default "0.0.0.0"
     public var port: Int
     public var tls: TLSConfiguration?
+    public var tlsManager: TLSContextManager?  // live-updatable per-domain (SNI) TLS; takes
+                                                // precedence over `tls` when both are set —
+                                                // see "Advanced: multi-tenant / hot-reloadable TLS"
     public var idleTimeout: TimeAmount?  // default .seconds(60) — nil disables
     public var reusePortCount: Int       // default 1; >1 opens multiple sockets in *this* process via SO_REUSEPORT
     public var alwaysReusePort: Bool     // default false; sets SO_REUSEPORT on a single socket so a
@@ -936,9 +976,9 @@ for desc in routes.describe {
 
 The PerfectNIO library is expected to compile and run on Linux — SwiftNIO is fully cross-platform, and the `CZlib` system library target includes an `apt` provider (`zlib1g-dev`).
 
-The `platforms: [.macOS(.v15)]` entry in `Package.swift` specifies the minimum macOS deployment target only. Linux support is always implicit in SwiftPM and is not restricted by that entry.
+The `platforms: [.macOS(.v26)]` entry in `Package.swift` specifies the minimum **macOS** deployment target only — `.v26` is a very new (leading-edge) macOS requirement, not a typo; if you're targeting an older macOS you'll need to fork/pin an earlier commit. Linux support is always implicit in SwiftPM and is not restricted by that entry, and no explicit Linux platform entry is declared.
 
-> **Research needed:** Linux support has not been CI-verified as part of this resurrection. `URLSessionWebSocketTask` availability in `swift-corelibs-foundation` on Linux needs confirmation before the test suite can be declared Linux-clean. The `LinuxMain.swift` file was intentionally removed — Swift 5.4+ auto-discovers tests on Linux via `swift test` without it.
+> **Research needed:** Linux support has not been CI-verified as part of this resurrection. `URLSessionWebSocketTask` availability in `swift-corelibs-foundation` on Linux needs confirmation before the test suite can be declared Linux-clean. The `LinuxMain.swift` file was intentionally removed — Swift 5.4+ auto-discovers tests on Linux via `swift test` without it. Separately, `swift build`/`swift test` for this repo currently requires the sibling `../Perfect-CRUD` and `../Perfect-MySQL` checkouts to be present regardless of platform (see [Package.swift](#packageswift)).
 
 To build and test on Linux:
 
@@ -948,4 +988,16 @@ apt-get install libssl-dev zlib1g-dev
 
 swift build
 swift test
+```
+
+### macOS
+
+`swift build` / `swift run` / `swift test` work the same way locally on macOS — see [Quick start](#quick-start). No extra system packages are required; `CZlib`/libz ships with the OS.
+
+### Live MySQL integration tests
+
+`Tests/PerfectNIOMySQLTests/MySQLIntegrationTests.swift` exercises `PerfectNIOCRUD` against a real MySQL instance and is skipped by default. Set `MYSQL_TESTS=1` in the environment to run it:
+
+```bash
+MYSQL_TESTS=1 swift test
 ```
