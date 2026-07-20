@@ -14,7 +14,7 @@
 
 A Swift 6 HTTP(S) server library built on SwiftNIO. Routes are a composable, strongly-typed pipeline: each step accepts one type and produces another, terminating in an `HTTPOutput` that writes the response. The library is an updated resurrection of the original [Perfect-NIO](https://github.com/PerfectlySoft/Perfect-NIO) project, part of the broader Perfect-Resurrection effort.
 
-**Ecosystem role:** PerfectNIO is the core HTTP/server layer for this resurrection effort — it is depended on directly, in production, by Perfect-Lasso (a live Lasso-language e-commerce site runs on top of it today), plus `FMTestApp` and `PerfectTemplate`. It is not a standalone demo library; changes here are load-bearing for a real running application. Logging is done via `import Logging` (apple/swift-log) directly — there is no dependency on Perfect-Logger.
+**Ecosystem role:** PerfectNIO is the core HTTP/server layer for this resurrection effort — it is depended on directly by Perfect-Lasso (a Swift reimplementation of the Lasso language, still in active development and not yet production-ready, though extensively validated by running real, unmodified Lasso code from multiple production e-commerce sites against it), plus `FMTestApp` and `PerfectTemplate`. It is not a standalone demo library; changes here are load-bearing for that ongoing validation work. Logging is done via `import Logging` (apple/swift-log) directly — there is no dependency on Perfect-Logger.
 
 - [Quick start](#quick-start)
 - [Package.swift](#packageswift)
