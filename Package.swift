@@ -17,8 +17,8 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.0"),
         .package(url: "https://github.com/apple/swift-nio-extras.git", from: "1.21.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
-        .package(path: "../Perfect-CRUD"),
-        .package(path: "../Perfect-MySQL"),
+        .package(url: "https://github.com/taplin/Perfect-CRUD.git", branch: "main"),
+        .package(url: "https://github.com/taplin/Perfect-MySQL.git", branch: "main"),
     ],
     targets: [
         // Local system library wrapping libz — replaces PerfectCZlib
