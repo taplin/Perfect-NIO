@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "PerfectNIO",
     platforms: [
-        .macOS(.v26),
+        .macOS(.v14),
     ],
     products: [
         .executable(name: "PerfectNIOExe", targets: ["PerfectNIOExe"]),
