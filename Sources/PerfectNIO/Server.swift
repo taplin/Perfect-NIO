@@ -308,21 +308,57 @@ public struct Server: Sendable {
 
 	/// Accept loop for one server channel: each accepted connection is handled in its own child
 	/// task so slow clients never block accepts. Returns when the channel closes or on cancellation.
+	///
+	/// `withThrowingDiscardingTaskGroup` needs macOS 14.0 — below that, falls back to a
+	/// bounded regular task group (see `runAcceptLoopBounded` below) so this file's own floor
+	/// doesn't force 14.0 on every caller. See the `taplin/Perfect-Lasso` repo's
+	/// `Documentation/macos-deployment-targets.md` for the full cross-repo investigation.
 	private static func runAcceptLoop(_ serverChannel: HTTPServerChannel,
 	                                  finder: any RouteFinder,
 	                                  isTLS: Bool) async {
 		do {
-			try await withThrowingDiscardingTaskGroup { connections in
-				try await serverChannel.executeThenClose { inbound in
-					for try await upgradeResult in inbound {
-						connections.addTask {
-							await Server.handleConnection(upgradeResult, finder: finder, isTLS: isTLS)
+			if #available(macOS 14, *) {
+				try await withThrowingDiscardingTaskGroup { connections in
+					try await serverChannel.executeThenClose { inbound in
+						for try await upgradeResult in inbound {
+							connections.addTask {
+								await Server.handleConnection(upgradeResult, finder: finder, isTLS: isTLS)
+							}
 						}
 					}
 				}
+			} else {
+				try await Server.runAcceptLoopBounded(serverChannel, finder: finder, isTLS: isTLS)
 			}
 		} catch {
 			// Server channel closed (cancellation / shutdown) or the accept loop failed.
+		}
+	}
+
+	/// Pre-macOS-14 fallback: a regular task group has no way to release a finished child's
+	/// result without the body calling `next()`, so an unbounded add-and-forget loop here
+	/// would retain bookkeeping for every connection accepted over the server's whole
+	/// lifetime. Capping in-flight connections and calling `next()` to free a slot before
+	/// accepting past the cap keeps memory bounded; new connections simply queue at the
+	/// kernel/NIO level until a slot frees.
+	private static func runAcceptLoopBounded(_ serverChannel: HTTPServerChannel,
+	                                         finder: any RouteFinder,
+	                                         isTLS: Bool) async throws {
+		let maxConcurrentConnections = 4096
+		try await withThrowingTaskGroup(of: Void.self) { connections in
+			var active = 0
+			try await serverChannel.executeThenClose { inbound in
+				for try await upgradeResult in inbound {
+					if active >= maxConcurrentConnections {
+						_ = try await connections.next()
+						active -= 1
+					}
+					connections.addTask {
+						await Server.handleConnection(upgradeResult, finder: finder, isTLS: isTLS)
+					}
+					active += 1
+				}
+			}
 		}
 	}
 
