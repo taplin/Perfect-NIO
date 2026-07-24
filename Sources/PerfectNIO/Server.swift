@@ -105,7 +105,7 @@ public struct Server: Sendable {
 			// Park until the surrounding task is cancelled — cancellation is the shutdown signal.
 			// Task.sleep throws on cancellation, so the loop exits promptly and serve() tears down.
 			while !Task.isCancelled {
-				try? await Task.sleep(for: .seconds(3600))
+				try? await Task.sleep(nanoseconds: 3600 * 1_000_000_000)
 			}
 		}
 	}
