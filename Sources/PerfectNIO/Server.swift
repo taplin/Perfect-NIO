@@ -207,7 +207,11 @@ public struct Server: Sendable {
 					if let manager = tlsManager {
 						try childChannel.pipeline.syncOperations.addHandler(SNIPeekHandler(manager: manager))
 					}
-					return try Server.configureUpgrade(channel: childChannel, finder: finder, isTLS: isTLS, idleTimeout: idle)
+					if #available(macOS 13, *) {
+						return try Server.configureUpgrade(channel: childChannel, finder: finder, isTLS: isTLS, idleTimeout: idle)
+					} else {
+						return try Server.configureUpgradeFallback(channel: childChannel, finder: finder, isTLS: isTLS, idleTimeout: idle)
+					}
 				}
 			}
 			channels.append(channel)
@@ -217,6 +221,11 @@ public struct Server: Sendable {
 
 	/// Configures the child channel's HTTP pipeline with a WebSocket upgrader. Returns the future
 	/// that resolves to either a normal HTTP connection or an upgraded WebSocket connection.
+	///
+	/// `NIOTypedHTTPServerUpgradeHandler` needs macOS 13.0 — below that, falls back to
+	/// `configureUpgradeFallback`, which does the same job with NIOHTTP1's older non-generic
+	/// `HTTPServerUpgradeHandler`, so this file's own floor doesn't force 13.0 on every caller.
+	@available(macOS 13, *)
 	private static func configureUpgrade(channel: Channel,
 	                                     finder: any RouteFinder,
 	                                     isTLS: Bool,
@@ -289,6 +298,82 @@ public struct Server: Sendable {
 		)
 		try sync.addHandler(upgradeHandler)
 		return upgradeHandler.upgradeResultFuture
+	}
+
+	/// Pre-13.0 fallback for `configureUpgrade`, built on NIOHTTP1's older non-generic
+	/// `HTTPServerUpgradeHandler`/`NIOWebSocketServerUpgrader` instead of the typed API. Same pipeline
+	/// shape and the same `WebSocketUpgradeRouter` pre-upgrade router, but since the non-generic
+	/// handler has no `upgradeResultFuture` of its own, the two outcomes (upgraded / not upgrading)
+	/// are unified into one `HTTPOrWebSocket` via a hand-built promise:
+	///   - on a successful WebSocket upgrade, `upgradePipelineHandler` below fulfills it directly;
+	///   - on a plain HTTP request, `HTTPServerUpgradeHandler` forwards the request unmodified to
+	///     `PlainHTTPFallbackHandler`, added at the tail, which fulfills it there.
+	/// These two paths are mutually exclusive per connection, matching the typed handler's own
+	/// upgrade-or-not decision, so the promise is always fulfilled exactly once.
+	private static func configureUpgradeFallback(channel: Channel,
+	                                             finder: any RouteFinder,
+	                                             isTLS: Bool,
+	                                             idleTimeout: TimeAmount?) throws -> EventLoopFuture<HTTPOrWebSocket> {
+		let resolved = NIOLockedValueBox<(WebSocketHandler, [WebSocketOption])?>(nil)
+		let promise = channel.eventLoop.makePromise(of: HTTPOrWebSocket.self)
+
+		let sync = channel.pipeline.syncOperations
+		let responseEncoder = HTTPResponseEncoder()
+		let requestDecoder = ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .forwardBytes))
+		var extraHTTPHandlers: [RemovableChannelHandler] = [requestDecoder]
+		try sync.addHandler(responseEncoder)
+		try sync.addHandler(requestDecoder)
+		let pipeliningHandler = HTTPServerPipelineHandler()
+		try sync.addHandler(pipeliningHandler)
+		extraHTTPHandlers.append(pipeliningHandler)
+		let headerValidator = NIOHTTPResponseHeadersValidator()
+		try sync.addHandler(headerValidator)
+		extraHTTPHandlers.append(headerValidator)
+		let errorHandler = HTTPServerProtocolErrorHandler()
+		try sync.addHandler(errorHandler)
+		extraHTTPHandlers.append(errorHandler)
+
+		try sync.addHandler(WebSocketUpgradeRouter(finder: finder, isTLS: isTLS, resolved: resolved))
+
+		// Constructed now (captured by wsUpgrader below) but added to the pipeline only after
+		// upgradeHandler, so it sits downstream and only ever sees data via HTTPServerUpgradeHandler's
+		// not-upgrading forwarding path (see its doc comment below).
+		let fallbackHandler = PlainHTTPFallbackHandler(idleTimeout: idleTimeout, promise: promise)
+
+		let wsUpgrader = NIOWebSocketServerUpgrader(
+			shouldUpgrade: { channel, _ in
+				let accept = resolved.withLockedValue { $0 } != nil
+				return channel.eventLoop.makeSucceededFuture(accept ? HTTPHeaders() : nil)
+			},
+			upgradePipelineHandler: { channel, _ in
+				// Remove the still-present, never-triggered plain-HTTP tail handler first: it would
+				// otherwise sit downstream of the WebSocket frame codec added next and misinterpret
+				// the first inbound WebSocketFrame as an HTTPServerRequestPart. Suppressed first so
+				// its own handlerRemoved doesn't race a spurious failure against the real success
+				// below.
+				fallbackHandler.suppressResolution()
+				return channel.pipeline.syncOperations.removeHandler(fallbackHandler)
+					.flatMap {
+						channel.eventLoop.makeCompletedFuture {
+							let wsChannel = try WebSocketConnectionChannel(wrappingChannelSynchronously: channel)
+							let noop: WebSocketHandler = { _ in }
+							let (handler, options) = resolved.withLockedValue { $0 } ?? (noop, [])
+							promise.succeed(.websocket(wsChannel, handler, options))
+						}
+					}
+			}
+		)
+
+		let upgradeHandler = HTTPServerUpgradeHandler(
+			upgraders: [wsUpgrader],
+			httpEncoder: responseEncoder,
+			extraHTTPHandlers: extraHTTPHandlers,
+			upgradeCompletionHandler: { _ in }
+		)
+		try sync.addHandler(upgradeHandler)
+		try sync.addHandler(fallbackHandler)
+
+		return promise.futureResult
 	}
 
 	/// Resolves a request against the routes and, if it lands on a `webSocket(...)` route,
@@ -427,6 +512,72 @@ private final class IdleTimeoutHandler: ChannelInboundHandler {
 		} else {
 			context.fireUserInboundEventTriggered(event)
 		}
+	}
+}
+
+/// Terminal handler for `configureUpgradeFallback`'s pre-13.0 pipeline. `HTTPServerUpgradeHandler`
+/// (the non-generic upgrader) has no `upgradeResultFuture`; instead it forwards a request's parts
+/// downstream unmodified, exactly once it determines a connection is not upgrading, then removes
+/// itself from the pipeline. This handler sits right after it and is therefore only ever reached via
+/// that not-upgrading path — never on a successful WebSocket upgrade, since `wsUpgrader`'s
+/// `upgradePipelineHandler` removes this handler first (see `configureUpgradeFallback`).
+///
+/// The first inbound part it ever sees is therefore always the start of a genuine plain-HTTP request:
+/// it adds the idle-timeout handlers (matching `configureUpgrade`'s `notUpgradingCompletionHandler`),
+/// wraps the channel, fulfills the promise, forwards the part into the new wrap, and removes itself.
+///
+/// If the connection closes before either outcome happens (e.g. a health-check probe or TLS-handshake
+/// failure that never sends a request), `HTTPServerUpgradeHandler` never forwards anything here and
+/// `channelRead` never fires — with no other safety net the promise would simply never resolve,
+/// hanging the accept loop's per-connection task forever. `handlerRemoved` closes that gap, mirroring
+/// `NIOTypedHTTPServerUpgradeHandler`'s own `handlerRemoved`-driven `.failUpgradePromise` behavior.
+/// `@unchecked Sendable`: lives on and is only touched on its channel's event loop.
+final class PlainHTTPFallbackHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
+	typealias InboundIn = HTTPServerRequestPart
+	typealias InboundOut = HTTPServerRequestPart
+
+	private let idleTimeout: TimeAmount?
+	private let promise: EventLoopPromise<HTTPOrWebSocket>
+	private var resolved = false
+
+	init(idleTimeout: TimeAmount?, promise: EventLoopPromise<HTTPOrWebSocket>) {
+		self.idleTimeout = idleTimeout
+		self.promise = promise
+	}
+
+	/// Called by `configureUpgradeFallback` right before it removes this handler as part of a
+	/// successful WebSocket upgrade, whose own `upgradePipelineHandler` fulfills the promise
+	/// separately. Without this, that removal would trigger `handlerRemoved` below while `resolved`
+	/// is still `false`, racing a spurious failure against the real, slightly later success.
+	func suppressResolution() {
+		resolved = true
+	}
+
+	func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+		guard !resolved else {
+			context.fireChannelRead(data)
+			return
+		}
+		resolved = true
+		do {
+			if let idleTimeout {
+				try context.pipeline.syncOperations.addHandler(IdleStateHandler(readTimeout: idleTimeout))
+				try context.pipeline.syncOperations.addHandler(IdleTimeoutHandler())
+			}
+			let httpChannel = try HTTPConnectionChannel(wrappingChannelSynchronously: context.channel)
+			promise.succeed(.http(httpChannel))
+		} catch {
+			promise.fail(error)
+		}
+		context.fireChannelRead(data)
+		context.fireChannelReadComplete()
+		context.pipeline.syncOperations.removeHandler(context: context, promise: nil)
+	}
+
+	func handlerRemoved(context: ChannelHandlerContext) {
+		guard !resolved else { return }
+		resolved = true
+		promise.fail(ChannelError.inputClosed)
 	}
 }
 
